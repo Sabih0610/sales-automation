@@ -7,7 +7,9 @@ from pydantic import BaseModel
 from src import orchestrator as orchestrator_module
 from src.config import settings
 from src.models import AgentEvent, Lead, Optional, PipelineRun
-from src.storage import event_repo, lead_repo, run_repo
+from src.personalisation.knowledge_base import KnowledgeBaseLoader
+from src.personalisation.orchestrator import PersonalisationOrchestrator
+from src.storage import db, event_repo, lead_repo, run_repo
 
 
 app = FastAPI(title="Royal Cyber Lead Pipeline API")
@@ -28,6 +30,7 @@ class StartPipelineRequest(BaseModel):
     geos: list[str] = []
     company_sizes: list[str] = []
     keywords: str = "Microsoft Fabric"
+    start_url: str = ""
     max_leads: int = 1000
 
 
@@ -51,12 +54,32 @@ class LeadResponse(BaseModel):
     full_name: str
     title: str
     company: str
+    phone: str
     email: str
     email_confidence: str
+    location: str
     segment: str
     intent_score: float
     linkedin_url: str
     status: str
+    email_subject: str = ""
+    email_body: str = ""
+    linkedin_message: str = ""
+    research_summary: str = ""
+    campaign_name: str = ""
+
+
+class PersonaliseRequest(BaseModel):
+    campaign: str
+
+
+PERSONALISATION_FIELDS = [
+    "email_subject",
+    "email_body",
+    "linkedin_message",
+    "research_summary",
+    "campaign_name",
+]
 
 
 def _dt(value) -> Optional[str]:
@@ -86,13 +109,44 @@ def _lead_response(lead: Lead) -> LeadResponse:
         full_name=lead.full_name,
         title=lead.title,
         company=lead.company,
+        phone=lead.phone,
         email=lead.email,
         email_confidence=lead.email_confidence,
+        location=lead.location,
         segment=lead.segment.value,
         intent_score=lead.intent_score,
         linkedin_url=lead.linkedin_url,
         status=lead.status.value,
+        email_subject=getattr(lead, "email_subject", ""),
+        email_body=getattr(lead, "email_body", ""),
+        linkedin_message=getattr(lead, "linkedin_message", ""),
+        research_summary=getattr(lead, "research_summary", ""),
+        campaign_name=getattr(lead, "campaign_name", ""),
     )
+
+
+def _attach_personalisation_fields(run_id: str, leads: list[Lead]) -> None:
+    if not leads:
+        return
+    conn = db._conn()
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(leads)").fetchall()
+    }
+    if not set(PERSONALISATION_FIELDS).issubset(existing):
+        return
+    columns = ", ".join(PERSONALISATION_FIELDS)
+    rows = conn.execute(
+        f"SELECT id, {columns} FROM leads WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    for lead in leads:
+        row = by_id.get(lead.id)
+        if not row:
+            continue
+        for field in PERSONALISATION_FIELDS:
+            setattr(lead, field, row[field] or "")
 
 
 def _event_json(event: AgentEvent) -> dict:
@@ -112,6 +166,7 @@ def _filters(request: StartPipelineRequest) -> dict:
         "geos": request.geos,
         "company_sizes": request.company_sizes,
         "keywords": request.keywords,
+        "start_url": request.start_url,
     }
 
 
@@ -159,6 +214,7 @@ def get_run_leads(
     if segment:
         target = segment.upper()
         leads = [lead for lead in leads if lead.segment.value == target]
+    _attach_personalisation_fields(run_id, leads)
     return [_lead_response(lead) for lead in leads[offset : offset + limit]]
 
 
@@ -179,6 +235,32 @@ def export_run_leads(run_id: str) -> dict:
 @app.get("/api/status")
 def get_status() -> dict:
     return orchestrator.get_status()
+
+
+@app.post("/api/runs/{run_id}/personalise")
+def personalise_run(run_id: str, request: PersonaliseRequest) -> dict:
+    """Trigger Phase 2 personalisation for a run's leads."""
+    run = run_repo.get(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    orchestrator = PersonalisationOrchestrator()
+    result = orchestrator.run(
+        run_id=run_id,
+        campaign_name=request.campaign,
+    )
+    return result
+
+
+@app.get("/api/campaigns")
+def list_campaigns() -> list[dict]:
+    """Return all available campaigns."""
+    return KnowledgeBaseLoader.list_campaigns()
+
+
+@app.get("/api/knowledge-bases")
+def list_knowledge_bases() -> list[str]:
+    """Return all available KB files."""
+    return KnowledgeBaseLoader.list_kb_files()
 
 
 @app.websocket("/ws/runs/{run_id}")

@@ -1,0 +1,29 @@
+Royal Cyber Azure AI Foundry — LLM Operations
+
+WHAT IT IS:
+Azure AI Foundry (formerly Azure AI Studio) is Microsoft's platform
+for building, deploying, and managing enterprise AI applications
+using large language models including GPT-4, Phi-3, and custom models.
+
+PROBLEMS IT SOLVES:
+- Companies want to use AI but lack the infrastructure to deploy
+  and manage LLMs securely at enterprise scale.
+- Proof-of-concept AI projects never reach production.
+- Data privacy concerns prevent use of public AI APIs.
+- AI costs spiral without proper usage management.
+
+HOW ROYAL CYBER HELPS:
+We implement AI Foundry end-to-end — from model selection and
+fine-tuning to production deployment with security, monitoring,
+and cost controls. We build on your existing Azure investment.
+
+TYPICAL OUTCOMES:
+- Production AI applications deployed in 6-10 weeks
+- Enterprise data never leaves your Azure tenant
+- 40% cost reduction vs public API usage at scale
+- Full audit trails for AI outputs (compliance ready)
+
+TARGET PERSONAS:
+- CTO: enterprise AI strategy and secure deployment
+- VP Engineering: AI infrastructure and DevOps integration
+- Innovation/Digital Transformation leads

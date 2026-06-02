@@ -97,10 +97,14 @@ function LeadTable({ runId }) {
               <th>Name</th>
               <th>Title</th>
               <th>Company</th>
+              <th>Phone</th>
+              <th>Location</th>
               <th>Email</th>
               <th>Confidence</th>
               <th>Segment</th>
               <th>LinkedIn</th>
+              <th>Email Subject</th>
+              <th>LinkedIn Msg</th>
             </tr>
           </thead>
           <tbody>
@@ -109,6 +113,8 @@ function LeadTable({ runId }) {
                 <td>{lead.full_name || "-"}</td>
                 <td>{lead.title || "-"}</td>
                 <td>{lead.company || "-"}</td>
+                <td>{lead.phone || "-"}</td>
+                <td>{lead.location || "-"}</td>
                 <td>{lead.email || "-"}</td>
                 <td>
                   <span className="badge neutral">
@@ -135,11 +141,29 @@ function LeadTable({ runId }) {
                     "-"
                   )}
                 </td>
+                <td title={lead.email_body || ""}>
+                  {lead.email_subject ? (
+                    <span className="has-message" title={lead.email_body}>
+                      {lead.email_subject}
+                    </span>
+                  ) : (
+                    "-"
+                  )}
+                </td>
+                <td>
+                  {lead.linkedin_message ? (
+                    <span className="has-message" title={lead.linkedin_message}>
+                      {lead.linkedin_message.slice(0, 40)}...
+                    </span>
+                  ) : (
+                    "-"
+                  )}
+                </td>
               </tr>
             ))}
             {!loading && leads.length === 0 && (
               <tr>
-                <td colSpan="7" className="empty-cell">
+                <td colSpan="11" className="empty-cell">
                   No leads found.
                 </td>
               </tr>

@@ -1,0 +1,19 @@
+{
+  "name": "Microsoft Fabric for Financial Data Teams",
+  "description": "Targeting Heads of Data and VP Analytics in financial services",
+  "knowledge_bases": [
+    "fabric_lakehouse.txt",
+    "fabric_realtime.txt"
+  ],
+  "target_personas": ["Head of Data", "VP Analytics", "Chief Data Officer", "VP Data"],
+  "target_industries": ["Banking", "Finance", "Insurance", "FinTech"],
+  "tone": "professional",
+  "max_email_words": 150,
+  "max_linkedin_chars": 280,
+  "email_goal": "book a 20-minute discovery call",
+  "key_pain_points": [
+    "regulatory reporting delays",
+    "real-time risk monitoring gaps",
+    "fragmented data across legacy systems"
+  ]
+}

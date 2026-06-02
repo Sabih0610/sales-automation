@@ -1,0 +1,27 @@
+Royal Cyber Azure AI Foundry — Custom Copilot Development
+
+WHAT IT IS:
+Building custom Copilot experiences on top of Microsoft 365 Copilot
+and Azure AI Foundry — internal assistants, customer-facing bots,
+and process automation powered by your own enterprise data.
+
+PROBLEMS IT SOLVES:
+- Employees spend hours searching for information across systems.
+- Customer support teams handle repetitive queries manually.
+- Standard Microsoft 365 Copilot is generic — not trained on
+  company-specific knowledge.
+
+HOW ROYAL CYBER HELPS:
+We design and build custom Copilots grounded in your company data —
+SharePoint, CRM, ERP, internal wikis — so your teams get accurate,
+contextual AI assistance specific to your business.
+
+TYPICAL OUTCOMES:
+- 30-50% reduction in time spent searching for information
+- Customer query resolution time cut by 60%
+- Onboarding time for new employees reduced significantly
+
+TARGET PERSONAS:
+- CIO: enterprise productivity and Microsoft 365 ROI
+- HR/Operations: employee experience and efficiency
+- Customer Success teams: support automation

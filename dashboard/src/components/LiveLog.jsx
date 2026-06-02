@@ -1,69 +1,70 @@
-import { useEffect, useRef, useState } from "react";
-import { getRunEvents, openWS } from "../api";
+import { useEffect, useRef, useState } from "react"
+import { getRunEvents, openWS } from "../api"
 
-const summarize = (payload = {}) => {
-  const text = JSON.stringify(payload);
-  return text.length > 120 ? `${text.slice(0, 117)}...` : text;
-};
+const timeOnly = (v) => {
+  if (!v) return ""
+  const d = new Date(v)
+  return isNaN(d) ? v.slice(11, 19) : d.toTimeString().slice(0, 8)
+}
 
-const timeOnly = (value) => {
-  if (!value) return "";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value.slice(11, 19) : date.toTimeString().slice(0, 8);
-};
+const rowClass = (event) => {
+  const s = event?.payload?.status
+  const t = event?.event_type
+  if (s === "browser_ready" || s === "waiting_for_login") return "log-row yellow"
+  if (s === "copying") return "log-row blue"
+  if (t === "LEAD_SCRAPED" && !s) return "log-row green"
+  if (t === "AGENT_FAILED" || t === "PIPELINE_FAILED") return "log-row red"
+  return "log-row"
+}
 
-function LiveLog({ runId }) {
-  const [events, setEvents] = useState([]);
-  const [wsReady, setWsReady] = useState(false);
-  const wsReadyRef = useRef(false);
-  const bottomRef = useRef(null);
+const summary = (event) => {
+  const p = event?.payload || {}
+  if (p.message) return p.message
+  if (p.name) return `${p.name}${p.company ? " @ " + p.company : ""} (${p.total_so_far || ""})`
+  if (p.status) return p.status
+  const t = JSON.stringify(p)
+  return t.length > 100 ? t.slice(0, 97) + "..." : t
+}
+
+export default function LiveLog({ runId, onEvent }) {
+  const [events, setEvents] = useState([])
+  const [wsReady, setWsReady] = useState(false)
+  const wsReadyRef = useRef(false)
+  const bottomRef = useRef(null)
 
   useEffect(() => {
-    let mounted = true;
-    let ws;
+    let mounted = true
+    let ws
 
-    const loadEvents = async () => {
+    const load = async () => {
       try {
-        const response = await getRunEvents(runId);
-        if (mounted) {
-          setEvents(response.data.slice().reverse().slice(-20));
-        }
-      } catch {
-        if (mounted) setWsReady(false);
-      }
-    };
+        const res = await getRunEvents(runId)
+        if (mounted) setEvents(res.data.slice().reverse().slice(-50))
+      } catch { /* ignore */ }
+    }
 
-    loadEvents();
-    ws = openWS(runId, (event) => {
-      setEvents((current) => [...current, event].slice(-20));
-    });
-    ws.onopen = () => {
-      wsReadyRef.current = true;
-      if (mounted) setWsReady(true);
-    };
-    ws.onerror = () => {
-      wsReadyRef.current = false;
-      if (mounted) setWsReady(false);
-    };
-    ws.onclose = () => {
-      wsReadyRef.current = false;
-      if (mounted) setWsReady(false);
-    };
+    load()
+    ws = openWS(runId, (ev) => {
+      setEvents(cur => [...cur, ev].slice(-50))
+      onEvent?.(ev)
+    })
+    ws.onopen = () => { wsReadyRef.current = true; if (mounted) setWsReady(true) }
+    ws.onerror = ws.onclose = () => {
+      wsReadyRef.current = false; if (mounted) setWsReady(false)
+    }
 
-    const fallback = window.setInterval(() => {
-      if (!wsReadyRef.current) loadEvents();
-    }, 5000);
+    const fallback = setInterval(() => {
+      if (!wsReadyRef.current) load()
+    }, 4000)
 
     return () => {
-      mounted = false;
-      window.clearInterval(fallback);
-      ws?.close();
-    };
-  }, [runId]);
+      mounted = false; clearInterval(fallback); ws?.close()
+    }
+  }, [runId, onEvent])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [events]);
+    bottomRef.current?.scrollIntoView({ block: "end" })
+  }, [events])
 
   return (
     <section className="panel live-log">
@@ -72,19 +73,16 @@ function LiveLog({ runId }) {
         <span className={`dot ${wsReady ? "online" : "offline"}`} />
       </div>
       <div className="log-list">
-        {events.length === 0 && <p className="empty">No events yet.</p>}
-        {events.map((event, index) => (
-          <div className="log-row" key={`${event.timestamp}-${index}`}>
-            <time>{timeOnly(event.timestamp)}</time>
-            <strong>{event.agent_name}</strong>
-            <span>{event.event_type}</span>
-            <small>{summarize(event.payload)}</small>
+        {events.length === 0 && <p className="empty">Waiting for events...</p>}
+        {events.map((ev, i) => (
+          <div className={rowClass(ev)} key={`${ev.timestamp}-${i}`}>
+            <time>{timeOnly(ev.timestamp)}</time>
+            <strong>{ev.agent_name}</strong>
+            <small>{summary(ev)}</small>
           </div>
         ))}
         <div ref={bottomRef} />
       </div>
     </section>
-  );
+  )
 }
-
-export default LiveLog;

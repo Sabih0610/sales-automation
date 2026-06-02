@@ -15,6 +15,7 @@ def _filters(args: argparse.Namespace) -> dict:
         "geos": _csv(args.geos),
         "company_sizes": [],
         "keywords": args.keywords,
+        "start_url": args.start_url,
     }
 
 
@@ -145,6 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--industries", default="")
     run.add_argument("--geos", default="")
     run.add_argument("--keywords", default="Microsoft Fabric")
+    run.add_argument(
+        "--url",
+        dest="start_url",
+        default="",
+        help="URL to scrape (any search results page)",
+    )
     run.add_argument("--max", dest="max_leads", type=int, default=1000)
     run.set_defaults(func=run_pipeline)
 

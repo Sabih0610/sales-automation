@@ -1,0 +1,19 @@
+{
+  "name": "Microsoft Fabric for Retail CTOs",
+  "description": "Targeting CTOs and CIOs in retail who need unified data infrastructure",
+  "knowledge_bases": [
+    "fabric_lakehouse.txt",
+    "fabric_pipelines.txt"
+  ],
+  "target_personas": ["CTO", "CIO", "CXO", "Chief Technology Officer"],
+  "target_industries": ["Retail", "E-commerce", "Consumer Goods"],
+  "tone": "professional",
+  "max_email_words": 150,
+  "max_linkedin_chars": 280,
+  "email_goal": "book a 20-minute discovery call",
+  "key_pain_points": [
+    "data silos across retail systems",
+    "slow reporting delaying business decisions",
+    "high data infrastructure costs"
+  ]
+}

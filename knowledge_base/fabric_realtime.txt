@@ -1,0 +1,26 @@
+Royal Cyber Microsoft Fabric — Real-Time Analytics
+
+WHAT IT IS:
+Fabric Real-Time Intelligence (formerly Synapse Real-Time Analytics)
+enables streaming data ingestion and analysis at scale using
+Eventstream and KQL databases.
+
+PROBLEMS IT SOLVES:
+- Businesses making decisions on yesterday's data.
+- IoT and event data is collected but never analysed in time.
+- Operational dashboards refresh hourly instead of in seconds.
+
+HOW ROYAL CYBER HELPS:
+We design and implement real-time data architectures on Fabric,
+connecting streaming sources (IoT devices, clickstreams, transactions)
+to real-time dashboards and automated alerts.
+
+TYPICAL OUTCOMES:
+- Dashboards updating in seconds instead of hours
+- Automated alerts on business anomalies
+- IoT data going from sensor to insight in under 60 seconds
+
+TARGET PERSONAS:
+- Operations Directors: real-time visibility into operations
+- CTO: modern streaming architecture replacing batch processing
+- Head of Analytics: live reporting replacing scheduled reports

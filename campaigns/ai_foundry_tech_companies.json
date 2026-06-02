@@ -1,0 +1,19 @@
+{
+  "name": "Azure AI Foundry for Tech Companies",
+  "description": "Targeting CTOs and VP Engineering at software and IT companies",
+  "knowledge_bases": [
+    "ai_foundry_llmops.txt",
+    "ai_foundry_copilot.txt"
+  ],
+  "target_personas": ["CTO", "VP Engineering", "Head of AI", "Chief AI Officer"],
+  "target_industries": ["Software", "IT Services", "SaaS", "Technology"],
+  "tone": "conversational",
+  "max_email_words": 150,
+  "max_linkedin_chars": 280,
+  "email_goal": "book a 20-minute discovery call",
+  "key_pain_points": [
+    "AI proof of concepts not reaching production",
+    "data privacy concerns with public AI APIs",
+    "lack of enterprise AI governance"
+  ]
+}

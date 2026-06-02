@@ -1,0 +1,29 @@
+Royal Cyber Microsoft Fabric — Data Pipelines & Integration
+
+WHAT IT IS:
+Fabric Data Factory provides enterprise-grade data integration,
+replacing legacy ETL tools (SSIS, Informatica, Azure Data Factory)
+with a unified, low-code pipeline builder natively integrated
+with the Fabric ecosystem.
+
+PROBLEMS IT SOLVES:
+- Legacy ETL tools are expensive to license and maintain.
+- Data pipelines break frequently and are hard to monitor.
+- IT teams spend weeks building integrations that should take hours.
+- Data from CRM, ERP, marketing tools sits in silos.
+
+HOW ROYAL CYBER HELPS:
+We assess existing pipelines, prioritise migration by business impact,
+and rebuild in Fabric Data Factory with proper monitoring, alerting,
+and documentation.
+
+TYPICAL OUTCOMES:
+- 70% reduction in pipeline maintenance overhead
+- Integration delivery time reduced from weeks to days
+- Full pipeline observability and alerting
+- Elimination of legacy ETL licensing costs
+
+TARGET PERSONAS:
+- Head of Data Engineering: modernise pipeline infrastructure
+- CTO: reduce operational overhead and licensing costs
+- Data Architects: standardise integration patterns

@@ -1,52 +1,11 @@
-# Environment and secrets
 .env
-.env.*
-!.env.example
-
-# Runtime data and generated exports
-pipeline.db*
-output/
-*.sqlite
-*.sqlite3
-*.db
-*.db-*
-*.csv
-*.xlsx
-
-# Python
 __pycache__/
 *.py[cod]
-*$py.class
-.python-version
-.venv/
-venv/
-env/
-ENV/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Node / Vite
-node_modules/
-dashboard/node_modules/
-dashboard/dist/
-dist/
-build/
-.vite/
-
-# Local debug scripts
-test_curl.py
-
-# Logs and temp files
-*.log
-logs/
-tmp/
-temp/
-
-# Editor and OS files
+*.egg-info/
+pipeline.db*
+output/
+linkedin_session.json
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db
+dashboard/node_modules/
+dashboard/dist/

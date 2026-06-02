@@ -243,6 +243,12 @@ class LeadRepository:
                 """,
                 rows,
             )
+            sample = self.db._conn().execute(
+                "SELECT full_name, phone FROM leads ORDER BY rowid DESC LIMIT 3"
+            ).fetchall()
+            import logging
+
+            logging.getLogger(__name__).info(f"DB phone check: {sample}")
 
     def get_by_run(self, run_id: str) -> list[Lead]:
         rows = self.db._conn().execute(

@@ -98,33 +98,19 @@ class EnrichmentAgent(BaseAgent):
             return False, "error"
 
     def _enrich_free(self, lead: Lead) -> EnrichmentResult:
-        domain = self._clearbit_domain(lead.company)
-        if not domain or not lead.first_name or not lead.last_name:
-            return EnrichmentResult(
-                lead_id=lead.id,
-                success=False,
-                company_domain=domain,
-                mode_used=EnrichmentMode.FREE,
-            )
-        for candidate in self._email_candidates(
-            lead.first_name,
-            lead.last_name,
-            domain,
-        ):
-            exists, confidence = self._smtp_verify(candidate, domain)
-            if exists:
-                return EnrichmentResult(
-                    lead_id=lead.id,
-                    success=True,
-                    email=candidate,
-                    email_confidence=confidence,
-                    company_domain=domain,
-                    mode_used=EnrichmentMode.FREE,
-                )
-            time.sleep(0.4)
+        """
+        Free enrichment - domain discovery only.
+        No SMTP, no email guessing, no waiting.
+        ZoomInfo handles email enrichment separately.
+        """
+        domain = lead.company_domain
+
+        if not domain and lead.company:
+            domain = self._clearbit_domain(lead.company)
+
         return EnrichmentResult(
             lead_id=lead.id,
-            success=False,
+            success=bool(domain),
             company_domain=domain,
             mode_used=EnrichmentMode.FREE,
         )
@@ -236,8 +222,13 @@ class EnrichmentAgent(BaseAgent):
     def _apply(self, lead: Lead, result: EnrichmentResult) -> None:
         lead.email = result.email
         lead.email_confidence = result.email_confidence
-        lead.phone = result.phone
-        lead.company_domain = result.company_domain
+        # Only overwrite phone if enrichment found one.
+        # Never overwrite a scraped phone with empty string.
+        if result.phone:
+            lead.phone = result.phone
+        # Only overwrite domain if enrichment found one.
+        if result.company_domain:
+            lead.company_domain = result.company_domain
         lead.intent_score = result.intent_score
         lead.status = LeadStatus.ENRICHED
         lead.updated_at = datetime.utcnow()

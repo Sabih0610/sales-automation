@@ -1,0 +1,19 @@
+{
+  "name": "SAP Migration for Enterprise",
+  "description": "Targeting CTOs at enterprises running legacy SAP on-premise",
+  "knowledge_bases": [
+    "sap_migration.txt",
+    "fabric_lakehouse.txt"
+  ],
+  "target_personas": ["CTO", "CIO", "SAP Architect", "VP IT"],
+  "target_industries": ["Manufacturing", "Logistics", "Energy", "Utilities"],
+  "tone": "professional",
+  "max_email_words": 150,
+  "max_linkedin_chars": 280,
+  "email_goal": "book a 20-minute discovery call",
+  "key_pain_points": [
+    "high SAP on-premise maintenance costs",
+    "SAP data isolated from business analytics",
+    "delayed S/4HANA migration"
+  ]
+}
