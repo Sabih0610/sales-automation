@@ -9,3 +9,5 @@ linkedin_session.json
 .idea/
 dashboard/node_modules/
 dashboard/dist/
+*.log
+dashboard/*smoke*.png

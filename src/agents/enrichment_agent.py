@@ -1,3 +1,4 @@
+###src\agents\enrichment_agent.py
 import hashlib
 import hmac
 import json
@@ -222,13 +223,8 @@ class EnrichmentAgent(BaseAgent):
     def _apply(self, lead: Lead, result: EnrichmentResult) -> None:
         lead.email = result.email
         lead.email_confidence = result.email_confidence
-        # Only overwrite phone if enrichment found one.
-        # Never overwrite a scraped phone with empty string.
-        if result.phone:
-            lead.phone = result.phone
-        # Only overwrite domain if enrichment found one.
-        if result.company_domain:
-            lead.company_domain = result.company_domain
+        lead.phone = result.phone
+        lead.company_domain = result.company_domain
         lead.intent_score = result.intent_score
         lead.status = LeadStatus.ENRICHED
         lead.updated_at = datetime.utcnow()

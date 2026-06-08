@@ -1,3 +1,4 @@
+##src\storage.py
 import contextlib
 import json
 import sqlite3
@@ -276,6 +277,148 @@ class LeadRepository:
             elif row["segment"] == Segment.NO_EMAIL.value:
                 counts["no_email"] = row["total"]
         return counts
+
+    def update_from_enrichment(
+        self,
+        run_id: str,
+        enriched_leads: list[dict],
+    ) -> dict:
+        """
+        Update existing leads with enrichment data from ZoomInfo CSV.
+        Matches by LinkedIn URL first, then first+last+company fallback.
+        Only updates fields that ZoomInfo provided - never overwrites
+        with empty values.
+
+        enriched_leads: list of dicts with ZoomInfo column names
+        Returns: {"matched": N, "unmatched": N, "updated": N}
+        """
+        existing = self.get_by_run(run_id)
+        if not existing:
+            return {"matched": 0, "unmatched": len(enriched_leads), "updated": 0}
+
+        by_linkedin: dict[str, Lead] = {}
+        by_name_company: dict[str, Lead] = {}
+
+        for lead in existing:
+            if lead.linkedin_url:
+                key = lead.linkedin_url.lower().rstrip("/").split("?")[0]
+                by_linkedin[key] = lead
+            name_key = (
+                f"{lead.first_name.lower().strip()}"
+                f"|{lead.last_name.lower().strip()}"
+                f"|{lead.company.lower().strip()}"
+            )
+            by_name_company[name_key] = lead
+
+        matched = 0
+        unmatched = 0
+        updated_leads = []
+
+        for row in enriched_leads:
+            zi_linkedin = (
+                row.get("LinkedIn URL", "")
+                or row.get("linkedin_url", "")
+                or row.get("LinkedIn", "")
+            ).lower().rstrip("/").split("?")[0]
+
+            lead = None
+            if zi_linkedin:
+                lead = by_linkedin.get(zi_linkedin)
+
+            if not lead:
+                zi_first = (
+                    row.get("First Name", "")
+                    or row.get("first_name", "")
+                ).lower().strip()
+                zi_last = (
+                    row.get("Last Name", "")
+                    or row.get("last_name", "")
+                ).lower().strip()
+                zi_company = (
+                    row.get("Company Name", "")
+                    or row.get("company", "")
+                    or row.get("Company", "")
+                ).lower().strip()
+                name_key = f"{zi_first}|{zi_last}|{zi_company}"
+                lead = by_name_company.get(name_key)
+
+            if not lead:
+                unmatched += 1
+                continue
+
+            matched += 1
+
+            zi_email = (
+                row.get("Email Address", "")
+                or row.get("email", "")
+                or row.get("Email", "")
+            ).strip()
+            if zi_email and not lead.email:
+                lead.email = zi_email
+                lead.email_confidence = "zoominfo_verified"
+
+            zi_phone = (
+                row.get("Direct Phone Number", "")
+                or row.get("Phone", "")
+                or row.get("phone", "")
+                or row.get("Company Phone", "")
+            ).strip()
+            if zi_phone and not lead.phone:
+                lead.phone = zi_phone
+
+            zi_domain = (
+                row.get("Company Website", "")
+                or row.get("company_domain", "")
+                or row.get("Website", "")
+            ).strip()
+            if zi_domain:
+                import re
+
+                zi_domain = re.sub(r"https?://(www\.)?", "", zi_domain).rstrip("/")
+                if zi_domain and not lead.company_domain:
+                    lead.company_domain = zi_domain
+
+            zi_title = (
+                row.get("Job Title", "")
+                or row.get("title", "")
+                or row.get("Title", "")
+            ).strip()
+            if zi_title and not lead.title:
+                lead.title = zi_title
+
+            zi_intent = (
+                row.get("Intent Score", "")
+                or row.get("intent_score", "")
+                or row.get("IntentScore", "")
+            )
+            try:
+                intent_val = float(zi_intent)
+                if intent_val > 0:
+                    lead.intent_score = intent_val
+            except (ValueError, TypeError):
+                pass
+
+            zi_location_parts = []
+            for col in ["City", "State", "Country"]:
+                val = row.get(col, "").strip()
+                if val:
+                    zi_location_parts.append(val)
+            if zi_location_parts and not lead.location:
+                lead.location = ", ".join(zi_location_parts)
+
+            from datetime import datetime
+
+            lead.updated_at = datetime.utcnow()
+            updated_leads.append(lead)
+
+        if updated_leads:
+            self.save_batch(run_id, updated_leads)
+
+        return {
+            "matched": matched,
+            "unmatched": unmatched,
+            "updated": len(updated_leads),
+        }
 
     def _row_to_lead(self, row: sqlite3.Row) -> Lead:
         return Lead(
