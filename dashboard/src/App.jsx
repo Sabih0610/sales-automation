@@ -1,6 +1,7 @@
 import { BrowserRouter, NavLink, Route, Routes } from "react-router-dom"
 import Leads from "./pages/Leads"
 import Campaigns from "./pages/Campaigns"
+import CampaignDetail from "./pages/CampaignDetail"
 import Sequences from "./pages/Sequences"
 import Runs from "./pages/Runs"
 import Settings from "./pages/Settings"
@@ -61,6 +62,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/leads" element={<Leads />} />
             <Route path="/campaigns" element={<Campaigns />} />
+            <Route path="/campaigns/:filename" element={<CampaignDetail />} />
             <Route path="/sequences" element={<Sequences />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />

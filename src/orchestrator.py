@@ -5,7 +5,6 @@ import threading
 from typing import Callable, Optional
 
 from src.agents.base import BaseAgent
-from src.agents.enrichment_agent import EnrichmentAgent
 from src.agents.export_agent import ExportAgent
 from src.agents.scraper_agent import ScraperAgent
 from src.agents.segment_agent import SegmentAgent
@@ -69,10 +68,7 @@ class PipelineOrchestrator:
                 self._wire_agent(scraper)
                 leads = scraper.execute()
                 self._save_leads(run, leads)
-
-                enricher = EnrichmentAgent(run, leads)
-                self._wire_agent(enricher)
-                leads = enricher.execute()
+                run.total_enriched = 0
                 self._save_leads(run, leads)
 
                 segmenter = SegmentAgent(run, leads)

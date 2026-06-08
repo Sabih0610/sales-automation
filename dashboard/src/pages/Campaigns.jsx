@@ -1,22 +1,71 @@
 import { useEffect, useState } from "react"
-import { createCampaign, getCampaigns, getKnowledgeBases } from "../api"
+import { useNavigate } from "react-router-dom"
+import {
+  createCampaign,
+  getCampaignOverview,
+  getCampaigns,
+  getKnowledgeBases,
+  uploadKnowledgeBase,
+} from "../api"
+
+const emptyStats = {
+  total_leads: 0,
+  with_email: 0,
+  drafts_generated: 0,
+  emails_sent: 0,
+  followups_due: 0,
+  replies: 0,
+}
+
+const statItems = [
+  ["total_leads", "Leads"],
+  ["with_email", "With email"],
+  ["no_email", "Needs enrichment"],
+  ["drafts_generated", "Drafted"],
+  ["emails_sent", "Sent"],
+  ["followups_due", "Due"],
+]
 
 export default function Campaigns() {
+  const navigate = useNavigate()
   const [campaigns, setCampaigns] = useState([])
+  const [campaignStats, setCampaignStats] = useState({})
   const [kbFiles, setKbFiles] = useState([])
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState({
-    name: "", description: "", target_personas: "", target_industries: "",
-    tone: "professional", email_goal: "book a 20-minute discovery call",
-    max_email_words: 150, max_linkedin_chars: 280, knowledge_bases: []
+    name: "",
+    description: "",
+    target_personas: "",
+    target_industries: "",
+    tone: "professional",
+    email_goal: "book a 20-minute discovery call",
+    max_email_words: 150,
+    max_linkedin_chars: 280,
+    knowledge_bases: [],
   })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
   const [uploadingKb, setUploadingKb] = useState(false)
   const [uploadKbResult, setUploadKbResult] = useState(null)
 
+  const loadCampaigns = () => {
+    getCampaigns()
+      .then(async r => {
+        setCampaigns(r.data)
+        const pairs = await Promise.all(
+          r.data.map(c =>
+            getCampaignOverview(c.filename)
+              .then(res => [c.filename, res.data])
+              .catch(() => [c.filename, emptyStats])
+          )
+        )
+        setCampaignStats(Object.fromEntries(pairs))
+      })
+      .catch(() => {})
+  }
+
   useEffect(() => {
-    getCampaigns().then(r => setCampaigns(r.data)).catch(() => {})
+    loadCampaigns()
     getKnowledgeBases().then(r => setKbFiles(r.data)).catch(() => {})
   }, [])
 
@@ -25,8 +74,22 @@ export default function Campaigns() {
       ...f,
       knowledge_bases: f.knowledge_bases.includes(filename)
         ? f.knowledge_bases.filter(k => k !== filename)
-        : [...f.knowledge_bases, filename]
+        : [...f.knowledge_bases, filename],
     }))
+  }
+
+  const resetForm = () => {
+    setForm({
+      name: "",
+      description: "",
+      target_personas: "",
+      target_industries: "",
+      tone: "professional",
+      email_goal: "book a 20-minute discovery call",
+      max_email_words: 150,
+      max_linkedin_chars: 280,
+      knowledge_bases: [],
+    })
   }
 
   const handleKbUpload = async (e) => {
@@ -35,18 +98,13 @@ export default function Campaigns() {
     setUploadingKb(true)
     setUploadKbResult(null)
     try {
-      const formData = new FormData()
-      formData.append("file", file)
-      const res = await fetch(
-        "http://localhost:8000/api/knowledge-bases/upload",
-        { method: "POST", body: formData }
-      )
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || "Upload failed")
-      setUploadKbResult({ success: true, msg: data.message })
+      const res = await uploadKnowledgeBase(file)
+      setUploadKbResult({ success: true, msg: res.data.message })
       getKnowledgeBases().then(r => setKbFiles(r.data)).catch(() => {})
     } catch (err) {
-      setUploadKbResult({ error: err.message })
+      setUploadKbResult({
+        error: err.response?.data?.detail || err.message || "Upload failed",
+      })
     } finally {
       setUploadingKb(false)
       e.target.value = ""
@@ -54,9 +112,16 @@ export default function Campaigns() {
   }
 
   const handleSave = async () => {
-    if (!form.name.trim()) { setError("Campaign name is required"); return }
-    if (form.knowledge_bases.length === 0) { setError("Select at least one knowledge base"); return }
-    setSaving(true); setError("")
+    if (!form.name.trim()) {
+      setError("Campaign name is required")
+      return
+    }
+    if (form.knowledge_bases.length === 0) {
+      setError("Select at least one knowledge base")
+      return
+    }
+    setSaving(true)
+    setError("")
     try {
       await createCampaign({
         ...form,
@@ -66,13 +131,13 @@ export default function Campaigns() {
           .split(",").map(s => s.trim()).filter(Boolean),
       })
       setShowCreate(false)
-      setForm({ name: "", description: "", target_personas: "", target_industries: "",
-        tone: "professional", email_goal: "book a 20-minute discovery call",
-        max_email_words: 150, max_linkedin_chars: 280, knowledge_bases: [] })
-      getCampaigns().then(r => setCampaigns(r.data)).catch(() => {})
+      resetForm()
+      loadCampaigns()
     } catch (err) {
       setError(err.response?.data?.detail || "Failed to save campaign")
-    } finally { setSaving(false) }
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -83,16 +148,20 @@ export default function Campaigns() {
           <label className="btn" style={{ cursor: "pointer" }}>
             <i className="ti ti-file-upload" aria-hidden="true" />
             {uploadingKb ? "Uploading..." : "Upload KB file"}
-            <input type="file" accept=".txt,.pdf,.docx"
+            <input
+              type="file"
+              accept=".txt,.pdf,.docx"
               style={{ display: "none" }}
               onChange={handleKbUpload}
-              disabled={uploadingKb} />
+              disabled={uploadingKb}
+            />
           </label>
           <button className="btn primary" onClick={() => setShowCreate(true)}>
             <i className="ti ti-plus" aria-hidden="true" /> New campaign
           </button>
         </div>
       </div>
+
       {uploadKbResult && (
         <div style={{ padding: "0 24px 0" }}>
           <div className={`banner ${uploadKbResult.error ? "red" : "green"}`}
@@ -105,34 +174,60 @@ export default function Campaigns() {
           </div>
         </div>
       )}
+
       <div className="page-content">
-        <div className="grid2">
-          {campaigns.map(c => (
-            <div className="card" key={c.filename}>
-              <div className="card-head">
-                <h2>{c.name}</h2>
-                <span className="badge completed">Active</span>
-              </div>
-              <div className="card-body">
-                {c.description && (
-                  <p style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 12 }}>{c.description}</p>
-                )}
-                <div style={{ marginBottom: 10 }}>
-                  <div className="form-label" style={{ marginBottom: 6 }}>Knowledge bases</div>
-                  <div className="chips">
-                    {(c.knowledge_bases || []).map(kb => (
-                      <div className="chip purple" key={kb}>
-                        <i className="ti ti-file-text" aria-hidden="true" style={{ fontSize: 11 }} />{kb}
-                      </div>
-                    ))}
+        <div className="campaign-grid">
+          {campaigns.map(c => {
+            const stats = campaignStats[c.filename] || emptyStats
+            return (
+              <button
+                type="button"
+                className="campaign-card"
+                key={c.filename}
+                onClick={() => navigate(`/campaigns/${encodeURIComponent(c.filename)}`)}
+              >
+                <div className="campaign-card-head">
+                  <div>
+                    <h2>{c.name}</h2>
+                    <p>{c.description || "Campaign workspace"}</p>
                   </div>
+                  <span className="badge completed">Active</span>
                 </div>
-              </div>
-            </div>
-          ))}
+
+                <div className="campaign-stat-grid">
+                  {statItems.map(([key, label]) => (
+                    <div className="campaign-stat" key={key}>
+                      <strong>{stats[key] ?? 0}</strong>
+                      <span>{label}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="campaign-kbs">
+                  {(c.knowledge_bases || []).length > 0 ? (
+                    (c.knowledge_bases || []).map(kb => (
+                      <span className="chip" key={kb}>
+                        <i className="ti ti-file-text" aria-hidden="true" />
+                        {kb}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="campaign-muted">No KB files linked</span>
+                  )}
+                </div>
+
+                <div className="campaign-card-footer">
+                  <span>Open workspace</span>
+                  <i className="ti ti-arrow-right" aria-hidden="true" />
+                </div>
+              </button>
+            )
+          })}
           {campaigns.length === 0 && (
-            <div style={{ gridColumn: "1/-1", textAlign: "center", padding: 40, color: "var(--color-text-secondary)" }}>
-              No campaigns yet. Create your first one.
+            <div className="card" style={{ gridColumn: "1/-1" }}>
+              <div className="card-body" style={{ textAlign: "center", color: "var(--color-text-secondary)" }}>
+                Create campaign from JSON config.
+              </div>
             </div>
           )}
         </div>
@@ -191,13 +286,18 @@ export default function Campaigns() {
                     {kbFiles.map(kb => {
                       const sel = form.knowledge_bases.includes(kb)
                       return (
-                        <div className={`kb-card${sel ? " selected" : ""}`} key={kb} onClick={() => toggleKb(kb)}>
+                        <button
+                          type="button"
+                          className={`kb-card${sel ? " selected" : ""}`}
+                          key={kb}
+                          onClick={() => toggleKb(kb)}
+                        >
                           <i className="ti ti-file-text" aria-hidden="true" />
                           <div>
                             <div className="kb-title">{kb}</div>
                           </div>
                           {sel && <div className="kb-check"><i className="ti ti-check" aria-hidden="true" /></div>}
-                        </div>
+                        </button>
                       )
                     })}
                   </div>

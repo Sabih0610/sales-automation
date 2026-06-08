@@ -1,14 +1,41 @@
 import concurrent.futures
+import json
 import logging
 import sqlite3
+from pathlib import Path
 
 from src.models import Lead
 from src.personalisation.agents.context_agent import ContextAgent
 from src.personalisation.agents.web_research_agent import WebResearchAgent
 from src.personalisation.agents.writer_agent import WriterAgent
 from src.personalisation.knowledge_base import KnowledgeBaseLoader
-from src.personalisation.models import CampaignConfig, PersonalisedMessage
+from src.personalisation.models import (
+    CampaignConfig,
+    PersonalisedMessage,
+    ResearchResult,
+)
 from src.storage import db, lead_repo
+
+
+def _load_touch_template(campaign_name: str, touch_number: int) -> dict:
+    seq_path = Path("campaigns/sequences.json")
+    if not seq_path.exists():
+        return {}
+    try:
+        settings = json.loads(seq_path.read_text(encoding="utf-8"))
+        campaign_settings = settings.get(campaign_name)
+        if not campaign_settings:
+            normalized = campaign_name.replace(".json", "").lower()
+            for key, value in settings.items():
+                if key.replace(".json", "").lower() == normalized:
+                    campaign_settings = value
+                    break
+        for touch in (campaign_settings or {}).get("touches", []):
+            if int(touch.get("number", 0)) == touch_number:
+                return touch
+    except Exception:
+        return {}
+    return {}
 
 
 class PersonalisationOrchestrator:
@@ -119,6 +146,9 @@ class PersonalisationOrchestrator:
         run_id: str,
         campaign_name: str,
         max_workers: int = 3,
+        lead_ids: list[str] | None = None,
+        limit: int | None = None,
+        prefer_email: bool = False,
     ) -> dict:
         """
         Main entry point.
@@ -133,19 +163,58 @@ class PersonalisationOrchestrator:
             f"run_id={run_id}"
         )
 
-        leads = lead_repo.get_by_run(run_id)
-        if not leads:
+        all_leads = lead_repo.get_by_run(run_id)
+        if not all_leads:
             return {"error": "No leads found for this run", "total": 0}
 
-        self.logger.info(f"Personalising {len(leads)} leads...")
+        selected_ids = set(lead_ids or [])
+        if selected_ids:
+            leads = [lead for lead in all_leads if lead.id in selected_ids]
+        else:
+            leads = list(all_leads)
+            if prefer_email:
+                leads = [lead for lead in leads if lead.email]
+            if limit and limit > 0:
+                leads = leads[:limit]
+
+        skipped = 0
+        if selected_ids:
+            skipped += max(0, len(selected_ids) - len(leads))
+
+        if not leads:
+            return {
+                "run_id": run_id,
+                "campaign": campaign.name,
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "skipped": skipped,
+                "results": [],
+            }
+
+        self.logger.info(f"Personalising {len(leads)} selected leads...")
 
         research_agent = WebResearchAgent()
         context_agent = ContextAgent(campaign)
-        writer_agent = WriterAgent(campaign)
+        touch1_template = _load_touch_template(campaign_name, 1)
+        writer_agent = WriterAgent(campaign, touch1_template=touch1_template)
 
         results = []
         success = 0
         failed = 0
+
+        def research_one(lead: Lead) -> ResearchResult:
+            try:
+                return research_agent.research(lead)
+            except Exception as exc:
+                self.logger.exception(
+                    f"Research failed for {lead.full_name}: {exc}"
+                )
+                return ResearchResult(
+                    lead_id=lead.id,
+                    company_name=lead.company,
+                    error=str(exc),
+                )
 
         BATCH_SIZE = 5
         for i in range(0, len(leads), BATCH_SIZE):
@@ -155,12 +224,22 @@ class PersonalisationOrchestrator:
                 max_workers=max_workers
             ) as executor:
                 research_results = list(executor.map(
-                    research_agent.research, batch
+                    research_one, batch
                 ))
 
             for lead, research in zip(batch, research_results):
-                context = context_agent.get_context(lead, research)
-                message = writer_agent.write(lead, research, context)
+                try:
+                    context = context_agent.get_context(lead, research)
+                    message = writer_agent.write(lead, research, context)
+                except Exception as exc:
+                    self.logger.exception(
+                        f"Failed to personalise {lead.full_name}: {exc}"
+                    )
+                    message = PersonalisedMessage(
+                        lead_id=lead.id,
+                        campaign_name=campaign.name,
+                        error=str(exc),
+                    )
                 self._save_message(message, run_id)
                 results.append(message)
                 if message.error:
@@ -179,4 +258,17 @@ class PersonalisationOrchestrator:
             "total": len(leads),
             "success": success,
             "failed": failed,
+            "skipped": skipped,
+            "results": [
+                {
+                    "lead_id": message.lead_id,
+                    "email_subject": message.email_subject,
+                    "email_body": message.email_body,
+                    "linkedin_message": message.linkedin_message,
+                    "research_summary": message.research_summary,
+                    "campaign_name": message.campaign_name,
+                    "error": message.error,
+                }
+                for message in results
+            ],
         }

@@ -19,8 +19,13 @@ class WriterAgent:
     Combines lead data + research + KB context into personalised messages.
     """
 
-    def __init__(self, campaign: CampaignConfig):
+    def __init__(
+        self,
+        campaign: CampaignConfig,
+        touch1_template: dict | None = None,
+    ):
         self.campaign = campaign
+        self.touch1_template = touch1_template or {}
         self.logger = logging.getLogger(self.__class__.__name__)
         self._client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
         self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -64,6 +69,27 @@ class WriterAgent:
             if self.campaign.tone == "professional"
             else "Write in a friendly, conversational tone - like one professional to another."
         )
+        template_block = ""
+        if self.touch1_template:
+            template_block = f"""
+CAMPAIGN EMAIL TEMPLATE:
+Subject template:
+{self.touch1_template.get("subject_template", "")}
+
+Email body template:
+{self.touch1_template.get("email_body_template", "")}
+
+LinkedIn message template:
+{self.touch1_template.get("linkedin_message_template", "")}
+
+Template rules:
+- Personalise using lead/company context.
+- Keep the structure close to the template.
+- Do not invent false company facts.
+- If research is weak, use scraped title/company context only.
+- Keep email concise.
+- Return email_subject, email_body, linkedin_message, research_summary.
+"""
 
         return f"""
 You are an expert B2B sales copywriter for Royal Cyber, a Microsoft Gold Partner.
@@ -81,6 +107,8 @@ LEAD INFORMATION:
 RESEARCH ABOUT THEIR BUSINESS:
 {research_block if research_block else "No website data available. Use role and company name to infer context."}
 
+{template_block}
+
 CAMPAIGN PAIN POINTS TO ADDRESS:
 {chr(10).join("- " + p for p in self.campaign.key_pain_points)}
 
@@ -88,6 +116,8 @@ TASK:
 Write personalised outreach for this specific lead.
 Connect Royal Cyber's capabilities to THEIR specific business context.
 Do not write generic messages. Reference something specific about them.
+Follow the campaign template structure and intent when a template is provided.
+Do not invent false company facts. If research is weak, use scraped title/company context only.
 
 Return ONLY valid JSON with this exact structure:
 {{

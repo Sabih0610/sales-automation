@@ -142,6 +142,14 @@ class EmailAgent(BaseAgent):
             self.logger.error(f"Send failed to {to_email}: {exc}")
             return False
 
+    def send_direct(self, to_email: str, subject: str, body: str) -> dict:
+        try:
+            ok = self._send_email(to_email, subject, body)
+            return {"success": bool(ok), "error": ""}
+        except Exception as exc:
+            self.logger.exception("Direct email send failed")
+            return {"success": False, "error": str(exc)}
+
     def _get_sequence_status(self, lead: Lead) -> dict:
         """Read current sequence status for a lead from SQLite."""
         row = db._conn().execute(
@@ -221,12 +229,121 @@ class EmailAgent(BaseAgent):
         except Exception:
             return 999
 
+    def _get_sequence_touches(self) -> list[dict]:
+        default = [
+            {
+                "number": 1,
+                "delay_days": 0,
+                "subject_template": "{{touch1_subject}}",
+                "email_body_template": "",
+                "linkedin_message_template": "",
+            },
+            {
+                "number": 2,
+                "delay_days": 3,
+                "subject_template": "Re: {{touch1_subject}}",
+                "email_body_template": (
+                    "Hi {{first_name}},\n\n"
+                    "Just following up on my note about {{company}}.\n\n"
+                    "Would a short conversation make sense?\n\n"
+                    "Best,\n{{sender_name}}"
+                ),
+                "linkedin_message_template": "",
+            },
+            {
+                "number": 3,
+                "delay_days": 4,
+                "subject_template": "Following up - {{company}}",
+                "email_body_template": (
+                    "Hi {{first_name}},\n\n"
+                    "I do not want to keep filling your inbox, so I will "
+                    "make this my final follow-up.\n\n"
+                    "Should I close the loop for now?\n\n"
+                    "Best,\n{{sender_name}}"
+                ),
+                "linkedin_message_template": "",
+            },
+        ]
+
+        try:
+            campaign_name = ""
+            if hasattr(self.run, "filters") and self.run.filters:
+                campaign_name = (
+                    self.run.filters.get("campaign_key")
+                    or self.run.filters.get("campaign")
+                    or ""
+                )
+
+            if not campaign_name:
+                return default
+
+            from pathlib import Path
+            import json
+
+            seq_path = Path("campaigns/sequences.json")
+            if not seq_path.exists():
+                return default
+
+            all_settings = json.loads(seq_path.read_text(encoding="utf-8"))
+            settings = all_settings.get(campaign_name)
+
+            if not settings:
+                normalized = campaign_name.replace(".json", "").lower()
+                for key, value in all_settings.items():
+                    if key.replace(".json", "").lower() == normalized:
+                        settings = value
+                        break
+
+            touches = (settings or {}).get("touches") or default
+            return touches
+        except Exception:
+            return default
+
+    def _touch_for_number(self, touch_number: int) -> dict:
+        fallback = {
+            1: {
+                "number": 1,
+                "delay_days": 0,
+                "subject_template": "{{touch1_subject}}",
+                "email_body_template": "",
+                "linkedin_message_template": "",
+            },
+            2: {
+                "number": 2,
+                "delay_days": 3,
+                "subject_template": "Re: {{touch1_subject}}",
+                "email_body_template": "",
+                "linkedin_message_template": "",
+            },
+            3: {
+                "number": 3,
+                "delay_days": 4,
+                "subject_template": "Following up - {{company}}",
+                "email_body_template": "",
+                "linkedin_message_template": "",
+            },
+        }[touch_number]
+        for touch in self._get_sequence_touches():
+            try:
+                if int(touch.get("number", 0)) == touch_number:
+                    return touch
+            except (TypeError, ValueError):
+                continue
+        return fallback
+
+    def _delay_for_touch(self, touch_number: int) -> int:
+        touch = self._touch_for_number(touch_number)
+        try:
+            return int(touch.get("delay_days", 0))
+        except (TypeError, ValueError):
+            return 0
+
     def _should_send_day(self, seq: dict, day: int) -> bool:
         """
         Determine if this lead should receive a Day N email today.
         Day 1: never sent before.
-        Day 3: Day 1 sent 3+ days ago and Day 3 not sent.
-        Day 7: Day 3 sent 4+ days ago and Day 7 not sent.
+        Day 3: Touch 2 delay after Day 1 and Day 3 not sent.
+        Day 7: Touch 3 delay after Day 3 and Day 7 not sent.
         """
         status = seq.get("status", "")
         if status in ("replied", "unsubscribed", "complete"):
@@ -238,13 +355,15 @@ class EmailAgent(BaseAgent):
             return (
                 bool(seq.get("day1_sent_at"))
                 and not seq.get("day3_sent_at")
-                and self._days_since(seq.get("day1_sent_at", "")) >= 3
+                and self._days_since(seq.get("day1_sent_at", ""))
+                >= self._delay_for_touch(2)
             )
         if day == 7:
             return (
                 bool(seq.get("day3_sent_at"))
                 and not seq.get("day7_sent_at")
-                and self._days_since(seq.get("day3_sent_at", "")) >= 4
+                and self._days_since(seq.get("day3_sent_at", ""))
+                >= self._delay_for_touch(3)
             )
         return False
 
@@ -258,11 +377,110 @@ class EmailAgent(BaseAgent):
         return None
 
     def _subject_for_day(self, subject: str, day: int) -> str:
+        touch_number = {1: 1, 3: 2, 7: 3}.get(day, 1)
+        touch = self._touch_for_number(touch_number)
+        subject_template = touch.get("subject_template", "")
+        if subject_template:
+            lead = Lead()
+            setattr(lead, "email_subject", subject)
+            return self._render_template(subject_template, lead)
+        prefix = touch.get("subject_prefix", "")
+        return f"{prefix}{subject}"
+
+    def _campaign_value_prop(self) -> str:
+        campaign_name = ""
+        if hasattr(self.run, "filters") and self.run.filters:
+            campaign_name = (
+                self.run.filters.get("campaign_key")
+                or self.run.filters.get("campaign")
+                or ""
+            )
+        normalized = campaign_name.replace(".json", "").replace("_", " ").lower()
+        if "fabric" in normalized and "finance" in normalized:
+            return "governed Microsoft Fabric analytics"
+        if "fabric" in normalized:
+            return "unified retail data and Microsoft Fabric analytics"
+        if "sap" in normalized:
+            return "lower-risk SAP migration and modernization"
+        if "ai" in normalized or "foundry" in normalized:
+            return "secure enterprise AI adoption"
+        return "practical enterprise technology modernization"
+
+    def _render_template(
+        self,
+        template: str,
+        lead: Lead,
+        extra: dict | None = None,
+    ) -> str:
+        first_name = lead.first_name or (
+            lead.full_name.split()[0] if lead.full_name else ""
+        )
+        values = {
+            "first_name": first_name,
+            "full_name": lead.full_name or "",
+            "company": lead.company or "",
+            "title": lead.title or "",
+            "location": lead.location or "",
+            "lead_context": lead.title or lead.company or "",
+            "campaign_value_prop": self._campaign_value_prop(),
+            "sender_name": os.getenv("SENDER_NAME", "Royal Cyber Team"),
+            "touch1_subject": getattr(lead, "email_subject", "") or "",
+        }
+        if extra:
+            values.update(extra)
+
+        output = template or ""
+        for key, value in values.items():
+            output = output.replace("{{" + key + "}}", str(value))
+        return output
+
+    def _message_for_day(
+        self,
+        lead: Lead,
+        subject: str,
+        body: str,
+        day: int,
+    ) -> tuple[str, str]:
+        setattr(lead, "email_subject", subject)
+        setattr(lead, "email_body", body)
         if day == 1:
-            return subject
-        if day == 3:
-            return f"Re: {subject}"
-        return f"Following up - {subject}"
+            return subject, body
+
+        touch_number = {3: 2, 7: 3}.get(day, 1)
+        touch = self._touch_for_number(touch_number)
+        subject_template = touch.get("subject_template", "")
+        body_template = touch.get("email_body_template", "")
+
+        rendered_subject = (
+            self._render_template(subject_template, lead)
+            if subject_template
+            else self._subject_for_day(subject, day)
+        )
+        rendered_body = (
+            self._render_template(body_template, lead)
+            if body_template
+            else body
+        )
+        return rendered_subject, rendered_body
+
+    def _linkedin_for_day(
+        self,
+        lead: Lead,
+        linkedin_message: str,
+        day: int,
+    ) -> str:
+        if day == 1:
+            return linkedin_message
+        touch_number = {3: 2, 7: 3}.get(day, 1)
+        template = self._touch_for_number(touch_number).get(
+            "linkedin_message_template",
+            "",
+        )
+        return (
+            self._render_template(template, lead)
+            if template
+            else linkedin_message
+        )
 
     def run_agent(self) -> list[Lead]:
         if not self._sender:
@@ -288,13 +506,20 @@ class EmailAgent(BaseAgent):
                 self.skipped_count += 1
                 continue
 
-            send_subject = self._subject_for_day(subject, day_to_send)
+            setattr(lead, "email_subject", subject)
+            setattr(lead, "email_body", body)
+            send_subject, send_body = self._message_for_day(
+                lead,
+                subject,
+                body,
+                day_to_send,
+            )
             self.logger.info(
                 f"Sending Day {day_to_send} to "
                 f"{lead.full_name} <{lead.email}>"
             )
 
-            success = self._send_email(lead.email, send_subject, body)
+            success = self._send_email(lead.email, send_subject, send_body)
             if success:
                 day_col = f"day{day_to_send}_sent_at"
                 new_status = (

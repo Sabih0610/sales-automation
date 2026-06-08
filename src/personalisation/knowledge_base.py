@@ -40,6 +40,13 @@ class KnowledgeBaseLoader:
                     "name": data.get("name", f.stem),
                     "description": data.get("description", ""),
                     "knowledge_bases": data.get("knowledge_bases", []),
+                    "target_personas": data.get("target_personas", []),
+                    "target_industries": data.get("target_industries", []),
+                    "tone": data.get("tone", ""),
+                    "email_goal": data.get("email_goal", ""),
+                    "max_email_words": data.get("max_email_words", 150),
+                    "max_linkedin_chars": data.get("max_linkedin_chars", 280),
+                    "key_pain_points": data.get("key_pain_points", []),
                 })
             except Exception:
                 continue

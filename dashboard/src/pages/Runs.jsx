@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react"
-import { Link, useNavigate } from "react-router-dom"
+import { Link, useLocation, useNavigate } from "react-router-dom"
 import { getRuns, startRun, getCampaigns } from "../api"
 
 const PARSE_LIST = (v) => v.split(",").map(s => s.trim()).filter(Boolean)
 
 export default function Runs() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const preselectedCampaign = location.state?.campaign || ""
   const [runs, setRuns] = useState([])
   const [campaigns, setCampaigns] = useState([])
   const [form, setForm] = useState({
@@ -20,13 +22,17 @@ export default function Runs() {
     getRuns().then(r => setRuns(r.data)).catch(() => {})
     getCampaigns().then(r => {
       setCampaigns(r.data)
-      if (r.data.length > 0) setForm(f => ({ ...f, campaign: r.data[0].filename }))
+      if (preselectedCampaign) {
+        setForm(f => ({ ...f, campaign: preselectedCampaign }))
+      } else if (r.data.length > 0) {
+        setForm(f => ({ ...f, campaign: r.data[0].filename }))
+      }
     }).catch(() => {})
     const t = setInterval(() => {
       getRuns().then(r => setRuns(r.data)).catch(() => {})
     }, 5000)
     return () => clearInterval(t)
-  }, [])
+  }, [preselectedCampaign])
 
   const handleStart = async (e) => {
     e.preventDefault()
@@ -38,6 +44,7 @@ export default function Runs() {
         max_leads: Number(form.max_leads) || 100,
         titles: PARSE_LIST(form.titles),
         keywords: form.keywords,
+        campaign: form.campaign,
         geos: PARSE_LIST(form.geos),
         industries: [], company_sizes: [],
       })
@@ -116,15 +123,16 @@ export default function Runs() {
           <div className="table-wrap">
             <table>
               <thead>
-                <tr><th>ID</th><th>Started</th><th>Status</th><th>Scraped</th><th>Warm</th><th>Cold</th><th>Actions</th></tr>
+                <tr><th>ID</th><th>Campaign</th><th>Started</th><th>Status</th><th>Scraped</th><th>Warm</th><th>Cold</th><th>Actions</th></tr>
               </thead>
               <tbody>
                 {runs.length === 0 && (
-                  <tr><td colSpan="7" style={{ textAlign: "center", padding: 20, color: "var(--color-text-secondary)" }}>No runs yet</td></tr>
+                  <tr><td colSpan="8" style={{ textAlign: "center", padding: 20, color: "var(--color-text-secondary)" }}>No runs yet</td></tr>
                 )}
                 {runs.map(r => (
                   <tr key={r.id}>
                     <td style={{ fontFamily: "monospace", color: "var(--color-text-secondary)" }}>{r.id.slice(0, 8)}</td>
+                    <td className="truncate">{r.filters?.campaign || "-"}</td>
                     <td style={{ color: "var(--color-text-secondary)", whiteSpace: "nowrap" }}>{fmtDate(r.started_at)}</td>
                     <td>
                       {r.status === "RUNNING" && <span className="dot-live" />}
@@ -133,7 +141,19 @@ export default function Runs() {
                     <td>{r.total_scraped}</td>
                     <td>{r.total_warm}</td>
                     <td>{r.total_cold}</td>
-                    <td><Link to={`/runs/${r.id}`} className="btn xs">View</Link></td>
+                    <td>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <Link to={`/runs/${r.id}`} className="btn xs">View</Link>
+                        {r.filters?.campaign && (
+                          <button
+                            className="btn xs"
+                            onClick={() => navigate(`/campaigns/${encodeURIComponent(r.filters.campaign)}`)}
+                          >
+                            Campaign
+                          </button>
+                        )}
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>

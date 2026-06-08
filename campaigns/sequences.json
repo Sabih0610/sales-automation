@@ -1,0 +1,114 @@
+{
+  "ai_foundry_tech_companies.json": {
+    "touches": [
+      {
+        "number": 1,
+        "name": "Intro",
+        "delay_days": 0,
+        "subject_template": "{{company}} + Azure AI Foundry idea",
+        "email_body_template": "Hi {{first_name}},\n\nI noticed {{company}} is focused on {{lead_context}}. Many tech teams are exploring AI but struggle to move from proof-of-concept to secure production.\n\nRoyal Cyber helps teams implement Azure AI Foundry with enterprise-grade governance, data privacy, and cost control.\n\nWould it be worth a quick 20-minute call next week to see if this could support {{company}}?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, noticed your work at {{company}}. We help tech teams move AI from proof-of-concept to secure production with Azure AI Foundry. Would be happy to connect."
+      },
+      {
+        "number": 2,
+        "name": "Follow-up",
+        "delay_days": 3,
+        "subject_template": "Re: {{touch1_subject}}",
+        "email_body_template": "Hi {{first_name}},\n\nJust following up on my note about Azure AI Foundry for {{company}}.\n\nThe main reason I reached out is that many teams are trying to use AI securely without sending sensitive data into public AI APIs. Royal Cyber helps deploy AI inside the customer's Azure environment with governance and cost controls.\n\nWould a short conversation make sense?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, following up here as well. If secure AI deployment is relevant for {{company}}, I would be happy to share a quick idea."
+      },
+      {
+        "number": 3,
+        "name": "Final touch",
+        "delay_days": 4,
+        "subject_template": "Following up - {{company}}",
+        "email_body_template": "Hi {{first_name}},\n\nI do not want to keep filling your inbox, so I will make this my final follow-up.\n\nIf {{company}} is exploring secure AI deployment, governance, or Azure AI Foundry, Royal Cyber may be able to help.\n\nShould I close the loop for now, or would you be open to a quick discussion?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, final follow-up from my side. If Azure AI Foundry or secure enterprise AI is relevant, happy to connect."
+      }
+    ]
+  },
+  "fabric_retail_ctos.json": {
+    "touches": [
+      {
+        "number": 1,
+        "name": "Intro",
+        "delay_days": 0,
+        "subject_template": "{{company}} + Microsoft Fabric data idea",
+        "email_body_template": "Hi {{first_name}},\n\nI noticed your role at {{company}} and thought this may be relevant. Retail teams often have useful customer, store, ecommerce, and inventory data spread across too many systems.\n\nRoyal Cyber helps retail technology leaders use Microsoft Fabric to unify data, simplify reporting, and build a stronger foundation for analytics and AI.\n\nWould a 20-minute conversation next week be useful to compare notes?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, noticed your work at {{company}}. We help retail technology teams unify data with Microsoft Fabric for faster analytics and AI readiness. Happy to connect."
+      },
+      {
+        "number": 2,
+        "name": "Follow-up",
+        "delay_days": 3,
+        "subject_template": "Re: {{touch1_subject}}",
+        "email_body_template": "Hi {{first_name}},\n\nJust following up on my note about Microsoft Fabric for {{company}}.\n\nThe opportunity we often see in retail is reducing reporting delays caused by disconnected data sources. Royal Cyber helps consolidate those sources into a governed Fabric lakehouse so teams can move faster without adding more complexity.\n\nWould it make sense to discuss where Fabric could fit in your data roadmap?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, following up here too. If unified retail data or Microsoft Fabric is on the roadmap at {{company}}, happy to share a quick perspective."
+      },
+      {
+        "number": 3,
+        "name": "Final touch",
+        "delay_days": 4,
+        "subject_template": "Following up - {{company}} data modernization",
+        "email_body_template": "Hi {{first_name}},\n\nI will make this my final follow-up.\n\nIf {{company}} is looking at Microsoft Fabric, retail analytics, or data modernization, Royal Cyber may be able to help accelerate the path from scattered data to actionable insights.\n\nShould I close the loop for now, or is this worth a short conversation?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, final follow-up from my side. If Microsoft Fabric or retail data modernization is relevant for {{company}}, happy to connect."
+      }
+    ]
+  },
+  "fabric_finance_data_teams.json": {
+    "touches": [
+      {
+        "number": 1,
+        "name": "Intro",
+        "delay_days": 0,
+        "subject_template": "{{company}} + governed Fabric analytics",
+        "email_body_template": "Hi {{first_name}},\n\nI noticed your work at {{company}} and wanted to share a relevant idea. Finance data teams are often asked to move faster while keeping governance, lineage, and security tight.\n\nRoyal Cyber helps financial services teams implement Microsoft Fabric for governed analytics, streamlined pipelines, and trusted reporting.\n\nWould it be worth a brief call next week to see if this could support {{company}}?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, noticed your work at {{company}}. We help finance data teams use Microsoft Fabric for governed analytics and trusted reporting. Happy to connect."
+      },
+      {
+        "number": 2,
+        "name": "Follow-up",
+        "delay_days": 3,
+        "subject_template": "Re: {{touch1_subject}}",
+        "email_body_template": "Hi {{first_name}},\n\nFollowing up on my note about governed analytics for {{company}}.\n\nMany finance teams we speak with are modernizing reporting while keeping auditability and access controls front and center. Royal Cyber helps design Microsoft Fabric environments that support both speed and governance.\n\nWould a short discussion be useful?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, following up here as well. If governed analytics or Microsoft Fabric is relevant at {{company}}, happy to share a practical idea."
+      },
+      {
+        "number": 3,
+        "name": "Final touch",
+        "delay_days": 4,
+        "subject_template": "Following up - governed analytics for {{company}}",
+        "email_body_template": "Hi {{first_name}},\n\nI do not want to keep chasing, so I will close the loop after this.\n\nIf {{company}} is exploring Microsoft Fabric, governed data platforms, or trusted finance reporting, Royal Cyber may be able to help.\n\nShould I close this out, or would a quick call make sense?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, final note from my side. If governed Fabric analytics is relevant for {{company}}, happy to connect."
+      }
+    ]
+  },
+  "sap_migration_enterprise.json": {
+    "touches": [
+      {
+        "number": 1,
+        "name": "Intro",
+        "delay_days": 0,
+        "subject_template": "{{company}} + SAP migration planning",
+        "email_body_template": "Hi {{first_name}},\n\nI noticed your role at {{company}} and thought this may be timely. Enterprise teams planning SAP modernization often need to reduce migration risk while keeping business operations stable.\n\nRoyal Cyber helps organizations assess, plan, and execute SAP migration and modernization programs with a practical roadmap and integration support.\n\nWould a 20-minute conversation next week be useful?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, noticed your work at {{company}}. We help enterprise teams plan SAP migration and modernization with lower risk and clearer execution. Happy to connect."
+      },
+      {
+        "number": 2,
+        "name": "Follow-up",
+        "delay_days": 3,
+        "subject_template": "Re: {{touch1_subject}}",
+        "email_body_template": "Hi {{first_name}},\n\nJust following up on SAP migration planning for {{company}}.\n\nThe common challenge we see is balancing modernization goals with integration complexity, downtime risk, and stakeholder alignment. Royal Cyber helps create a migration plan that is technically sound and executable for the business.\n\nWould it make sense to compare notes?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, following up here too. If SAP migration or modernization is active at {{company}}, happy to share a practical planning approach."
+      },
+      {
+        "number": 3,
+        "name": "Final touch",
+        "delay_days": 4,
+        "subject_template": "Following up - SAP modernization at {{company}}",
+        "email_body_template": "Hi {{first_name}},\n\nI will make this my final follow-up.\n\nIf {{company}} is evaluating SAP migration, modernization, or integration planning, Royal Cyber may be able to help reduce risk and accelerate execution.\n\nShould I close the loop for now, or would you be open to a quick discussion?\n\nBest,\n{{sender_name}}",
+        "linkedin_message_template": "Hi {{first_name}}, final follow-up from my side. If SAP migration planning is relevant for {{company}}, happy to connect."
+      }
+    ]
+  }
+}

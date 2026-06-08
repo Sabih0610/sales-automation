@@ -5,6 +5,8 @@ __pycache__/
 pipeline.db*
 output/
 linkedin_session.json
+.env
+debug/
 .vscode/
 .idea/
 dashboard/node_modules/

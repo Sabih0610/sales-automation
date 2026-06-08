@@ -1,9 +1,7 @@
 ##src\agents\segment_agent.py
 
 from src.agents.base import BaseAgent
-from src.config import settings
 from src.models import (
-    EnrichmentMode,
     EventType,
     Lead,
     LeadStatus,
@@ -20,9 +18,16 @@ class SegmentAgent(BaseAgent):
     def _assign(self, lead: Lead) -> Segment:
         if not lead.email:
             return Segment.NO_EMAIL
-        if settings.enrichment_mode == EnrichmentMode.ZOOMINFO:
+
+        confidence = (lead.email_confidence or "").lower().strip()
+
+        if confidence == "zoominfo_verified":
             return Segment.WARM if lead.intent_score > 0 else Segment.COLD
-        return Segment.WARM if lead.email_confidence == "verified" else Segment.COLD
+
+        if confidence == "verified":
+            return Segment.WARM
+
+        return Segment.COLD
 
     def run_agent(self) -> list[Lead]:
         for lead in self.leads:

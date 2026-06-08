@@ -81,6 +81,28 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
                 """
             )
+            draft_columns = [
+                ("email_subject", "TEXT DEFAULT ''"),
+                ("email_body", "TEXT DEFAULT ''"),
+                ("linkedin_message", "TEXT DEFAULT ''"),
+                ("research_summary", "TEXT DEFAULT ''"),
+                ("campaign_name", "TEXT DEFAULT ''"),
+                ("personalised_at", "TEXT"),
+                ("email_sequence_status", "TEXT DEFAULT 'not_started'"),
+                ("day1_sent_at", "TEXT"),
+                ("day3_sent_at", "TEXT"),
+                ("day7_sent_at", "TEXT"),
+                ("email_sequence_error", "TEXT DEFAULT ''"),
+            ]
+            existing = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(leads)").fetchall()
+            }
+            for col_name, col_def in draft_columns:
+                if col_name not in existing:
+                    conn.execute(
+                        f"ALTER TABLE leads ADD COLUMN {col_name} {col_def}"
+                    )
 
 
 class RunRepository:
@@ -353,7 +375,7 @@ class LeadRepository:
                 or row.get("email", "")
                 or row.get("Email", "")
             ).strip()
-            if zi_email and not lead.email:
+            if zi_email:
                 lead.email = zi_email
                 lead.email_confidence = "zoominfo_verified"
 
@@ -363,7 +385,7 @@ class LeadRepository:
                 or row.get("phone", "")
                 or row.get("Company Phone", "")
             ).strip()
-            if zi_phone and not lead.phone:
+            if zi_phone:
                 lead.phone = zi_phone
 
             zi_domain = (
@@ -375,7 +397,7 @@ class LeadRepository:
                 import re
 
                 zi_domain = re.sub(r"https?://(www\.)?", "", zi_domain).rstrip("/")
-                if zi_domain and not lead.company_domain:
+                if zi_domain:
                     lead.company_domain = zi_domain
 
             zi_title = (
@@ -421,7 +443,7 @@ class LeadRepository:
         }
 
     def _row_to_lead(self, row: sqlite3.Row) -> Lead:
-        return Lead(
+        lead = Lead(
             id=row["id"],
             full_name=row["full_name"] or "",
             first_name=row["first_name"] or "",
@@ -441,6 +463,25 @@ class LeadRepository:
             created_at=_text_to_dt(row["created_at"]) or datetime.utcnow(),
             updated_at=_text_to_dt(row["updated_at"]) or datetime.utcnow(),
         )
+        setattr(lead, "run_id", row["run_id"] or "")
+        optional_fields = {
+            "email_subject": "",
+            "email_body": "",
+            "linkedin_message": "",
+            "research_summary": "",
+            "campaign_name": "",
+            "personalised_at": None,
+            "email_sequence_status": "not_started",
+            "day1_sent_at": None,
+            "day3_sent_at": None,
+            "day7_sent_at": None,
+            "email_sequence_error": "",
+        }
+        row_keys = set(row.keys())
+        for field, default in optional_fields.items():
+            if field in row_keys:
+                setattr(lead, field, row[field] or default)
+        return lead
 
 
 class EventRepository:

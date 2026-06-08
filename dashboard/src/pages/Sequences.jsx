@@ -45,6 +45,12 @@ export default function Sequences() {
         </div>
       </div>
       <div className="page-content">
+        <div className="banner blue" style={{ marginBottom: 16 }}>
+          <i className="ti ti-info-circle" aria-hidden="true" />
+          <div className="banner-msg">
+            For first-time testing, use Run Detail to review generated drafts, edit, and send selected emails.
+          </div>
+        </div>
         {sendResult && (
           <div className={`banner ${sendResult.error ? "red" : "green"}`}>
             <i className={`ti ti-${sendResult.error ? "alert-circle" : "check"}`} aria-hidden="true" />

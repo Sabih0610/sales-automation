@@ -1,6 +1,6 @@
 ##src\agents\scraper_agent.py
 
-import time, random, re, json, os, subprocess
+import time, random, re, json, os, subprocess, threading, traceback
 
 from openai import OpenAI
 from playwright.sync_api import sync_playwright, Page, BrowserContext
@@ -9,6 +9,23 @@ from src.agents.base import BaseAgent
 from src.config import settings
 from src.models import EventType, Lead, LeadStatus, PipelineRun
 from src.storage import run_repo
+
+
+def safe_str(value) -> str:
+    """Convert any AI-returned value into a clean string safely."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value).strip()
+    if isinstance(value, list):
+        return " ".join(safe_str(v) for v in value if safe_str(v)).strip()
+    if isinstance(value, dict):
+        return " ".join(
+            safe_str(v) for v in value.values() if safe_str(v)
+        ).strip()
+    return str(value).strip()
 
 
 class _BrowserAgent:
@@ -47,22 +64,46 @@ class _BrowserAgent:
                     time.sleep(3)
                     continue
 
-                text = page.evaluate(
-                    """
-                    () => {
-                        const remove = [
-                            'script','style','nav','footer',
-                            'header','noscript','iframe'
-                        ];
-                        remove.forEach(t =>
-                            document.querySelectorAll(t)
-                                    .forEach(el => el.remove())
-                        );
-                        return document.body
-                               ? document.body.innerText : '';
-                    }
-                    """
-                )
+                text = page.evaluate("""
+() => {
+    const clone = document.body.cloneNode(true);
+
+    const remove = [
+        'script', 'style', 'nav', 'footer',
+        'header', 'noscript', 'iframe'
+    ];
+
+    remove.forEach(tag => {
+        clone.querySelectorAll(tag).forEach(el => el.remove());
+    });
+
+    const visibleText = clone.innerText || '';
+
+    const linkLines = Array.from(document.querySelectorAll('a[href]'))
+        .map(a => {
+            const label = (a.innerText || '')
+                .trim()
+                .replace(/\\s+/g, ' ');
+            const href = (a.href || '').trim();
+
+            if (!href) return '';
+
+            if (
+                href.startsWith('mailto:') ||
+                href.startsWith('tel:') ||
+                href.startsWith('http')
+            ) {
+                return `${label} ${href}`.trim();
+            }
+
+            return '';
+        })
+        .filter(Boolean)
+        .join('\\n');
+
+    return visibleText + '\\n\\nLINKS FOUND:\\n' + linkLines;
+}
+""")
 
                 if text and len(text.strip()) > 300:
                     self.logger.info(
@@ -111,37 +152,87 @@ class _ExtractorAgent:
     """
 
     PROMPT = """
-You are a lead extraction expert. You will receive raw text from a web page.
-Your job is to find and extract every business or person listing on the page.
+You are a lead extraction expert. You will receive raw text copied from a browser page.
 
-STEP 1 - Understand the page structure first.
-Look at the text and identify what repeating pattern exists.
-Each site is different. Some use name then phone then address.
-Some use name then category then location. Figure it out from context.
+Your job is to extract real business/person leads into structured JSON.
 
-STEP 2 - Extract every field you can find for each listing.
-For each listing extract ALL of these if present:
-  full_name      : person name OR business name
-  first_name     : person first name if it is a person, else empty
-  last_name      : person last name if it is a person, else empty
-  title          : job title OR business category OR service type
-  company        : business or company name
-  phone          : any phone number associated with this listing
-  email          : any email address associated with this listing
-  location       : full address, city, state, country - everything visible
-  company_domain : website domain (strip https:// and www.)
-  linkedin_url   : any profile URL or listing URL
+IMPORTANT CONTEXT:
+The text may come from any website:
+- business directories
+- company listing pages
+- Sales Navigator/search result pages
+- Yellow Pages style pages
+- B2B directories
 
-STEP 3 - Rules to follow strictly:
-- Extract EVERY real listing. Do not skip one because a field is missing.
-- If a field exists in the text for a listing, include it. Never leave it
-  empty if the value is visible somewhere near that listing.
-- Skip ONLY: page navigation, cookie banners, login prompts, footer links,
-  pagination controls like "Next" "Previous" "Showing 1-30 of 3000".
-- Do not merge two listings into one.
-- Do not invent data that is not in the text.
-- Return ONLY a valid JSON array. No explanation. No markdown. No code fences.
-- If truly no listings found return: []
+The browser text may be flattened, so you must infer listing boundaries carefully.
+
+FIELDS TO RETURN FOR EACH LEAD:
+  full_name      : person name if the listing is a person; otherwise business/company name
+  first_name     : first name only if full_name is a person
+  last_name      : last name only if full_name is a person
+  title          : job title, role, business category, or service type
+  company        : company/business name
+  phone          : phone number associated with that listing
+  email          : email address associated with that listing
+  location       : full visible address/city/country if available
+  company_domain : website domain only, without https:// or www.
+  linkedin_url   : profile/listing/source URL if visible
+
+STRICT EXTRACTION RULES:
+1. One lead should represent one real lead/listing, not random text.
+
+2. For business directories:
+   - A lead should normally represent one company/business card.
+   - If a person/contact name appears inside or near a company listing, attach that person to that company.
+   - Do NOT create a separate person-only lead if the person is just a contact under a company.
+   - Example:
+     EFROTECH
+     Information technology, software development
+     Nadir Khan Feroz
+     should become:
+     full_name = "Nadir Khan Feroz"
+     company = "EFROTECH"
+     title = "Information technology, software development"
+
+3. If only a company is visible and no contact person is visible:
+   full_name = company name
+   company = company name
+
+4. For Sales Navigator or people search pages:
+   - A person profile can be a lead.
+   - But it must have at least company, title, location, profile URL, email, or phone.
+
+5. Do not create standalone person rows unless that person has clear business context:
+   company, title, email, phone, location, domain, or profile/listing URL.
+
+6. Extract emails from:
+   - visible email text
+   - mailto: links in LINKS FOUND
+
+7. Extract phones from:
+   - visible phone text
+   - tel: links in LINKS FOUND
+
+8. Extract website domains from:
+   - visible website text
+   - http/https links in LINKS FOUND
+
+9. If a visible line says Email, Website, Call, Contact, or Visit Website and LINKS FOUND contains the actual href, use the href value.
+
+10. Skip:
+    - navigation
+    - footer links
+    - login/sign-up prompts
+    - pagination controls
+    - cookie banners
+    - ads
+    - headings like Premium, Basic, Business Details, Person Details
+
+11. Do not invent missing data.
+
+12. Return ONLY a valid JSON array. No explanation. No markdown. No code fences.
+
+13. If truly no leads are found, return: []
 
 PAGE TEXT:
 {text}
@@ -153,6 +244,11 @@ PAGE TEXT:
             api_key=os.getenv("OPENAI_API_KEY", "")
         )
         self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._local = threading.local()
+
+    @property
+    def last_raw_response(self) -> str:
+        return getattr(self._local, "last_raw_response", "")
 
     def extract(self, text: str) -> list[dict]:
         if not text or len(text) < 100:
@@ -165,6 +261,8 @@ PAGE TEXT:
         ]
 
         all_items = []
+        raw_responses = []
+        self._local.last_raw_response = ""
         for chunk in chunks:
             try:
                 resp = self._client.chat.completions.create(
@@ -177,15 +275,29 @@ PAGE TEXT:
                     max_tokens=2000,
                 )
                 content = (
-                    resp.choices[0].message.content
-                    .strip()
+                    safe_str(resp.choices[0].message.content)
                     .replace("```json", "")
                     .replace("```", "")
                     .strip()
                 )
-                items = json.loads(content)
-                if isinstance(items, list):
-                    all_items.extend(items)
+                raw_responses.append(content)
+                self._local.last_raw_response = (
+                    "\n\n--- CHUNK ---\n\n".join(raw_responses)
+                )
+                parsed = json.loads(content)
+
+                if isinstance(parsed, dict):
+                    if isinstance(parsed.get("leads"), list):
+                        parsed = parsed["leads"]
+                    else:
+                        parsed = []
+
+                if not isinstance(parsed, list):
+                    parsed = []
+
+                all_items.extend(
+                    item for item in parsed if isinstance(item, dict)
+                )
             except json.JSONDecodeError as e:
                 self.logger.warning(
                     f"JSON parse error in chunk: {e}"
@@ -207,7 +319,7 @@ class _VerifierAgent:
     """
     Validates each raw dict.
     Returns (valid_items, junk_count).
-    A lead is valid if it has a name AND at least one contact field.
+    A lead is valid if it has a name and business context.
     """
 
     JUNK_NAMES = {
@@ -223,11 +335,8 @@ class _VerifierAgent:
 
     def verify(self, items: list[dict]) -> tuple[list[dict], int]:
         """
-        Only discard items that are clearly not leads.
-        Keep everything that looks like a real listing
-        even if phone/email/domain are all missing.
-        A listing is valid if it has a non-empty name
-        that is not a known navigation/junk label.
+        Keep listings that have a usable name/company and at least
+        one business context field.
         """
         JUNK_NAMES = {
             "next", "previous", "prev", "back", "forward",
@@ -239,6 +348,9 @@ class _VerifierAgent:
             "cookie", "advertisement", "sponsored", "ad",
             "navigation", "pagination", "footer", "header",
             "close", "open", "expand", "collapse",
+            "premium", "basic", "business details", "person details",
+            "contact details", "details", "call", "email", "website",
+            "visit website", "more", "less",
         }
 
         valid = []
@@ -249,11 +361,9 @@ class _VerifierAgent:
                 junk += 1
                 continue
 
-            name = (
-                item.get("full_name")
-                or item.get("company")
-                or ""
-            ).strip()
+            name = safe_str(item.get("full_name")) or safe_str(
+                item.get("company")
+            )
 
             if not name or len(name) < 2:
                 junk += 1
@@ -264,6 +374,28 @@ class _VerifierAgent:
                 continue
 
             if len(name.split()) == 1 and len(name) < 4:
+                junk += 1
+                continue
+
+            company = safe_str(item.get("company"))
+            title = safe_str(item.get("title"))
+            email = safe_str(item.get("email"))
+            phone = safe_str(item.get("phone"))
+            location = safe_str(item.get("location"))
+            domain = safe_str(item.get("company_domain"))
+            url = safe_str(item.get("linkedin_url"))
+
+            has_business_context = any([
+                company,
+                title,
+                email,
+                phone,
+                location,
+                domain,
+                url,
+            ])
+
+            if not has_business_context:
                 junk += 1
                 continue
 
@@ -285,6 +417,7 @@ class _FormatterAgent:
         self.logger = logger
 
     def _clean_phone(self, phone: str) -> str:
+        phone = safe_str(phone)
         if not phone or phone in ("None", "null", ""):
             return ""
         cleaned = re.sub(r"[^\d\s\+\(\)\-]", "", phone).strip()
@@ -294,46 +427,48 @@ class _FormatterAgent:
         return cleaned[:30]
 
     def _clean_domain(self, domain: str) -> str:
+        domain = safe_str(domain)
         domain = re.sub(r"https?://(www\.)?", "", domain)
         domain = domain.rstrip("/").strip()
         return domain[:100]
 
     def _clean_email(self, email: str) -> str:
-        email = email.strip().lower()
+        email = safe_str(email).lower()
         if "@" not in email or "." not in email:
             return ""
         return email[:100]
 
     def format(self, item: dict) -> Lead:
-        name = (
-            item.get("full_name")
-            or item.get("company")
-            or ""
-        ).strip()[:100]
+        full_name = safe_str(item.get("full_name"))
+        company = safe_str(item.get("company"))
+        name = (full_name or company)[:100]
         name_parts = name.split()
 
-        first = (
-            item.get("first_name")
-            or (name_parts[0] if name_parts else name)
-        ).strip()[:50]
+        first_name = safe_str(item.get("first_name"))
+        first = (first_name or (name_parts[0] if name_parts else name))[:50]
 
+        last_name = safe_str(item.get("last_name"))
         last = (
-            item.get("last_name")
+            last_name
             or (" ".join(name_parts[1:]) if len(name_parts) > 1 else "")
-        ).strip()[:50]
+        )[:50]
 
-        email = self._clean_email(item.get("email", ""))
-        raw_phone = str(
-            item.get("phone") or
-            item.get("telephone") or
-            item.get("mobile") or
-            ""
+        title = safe_str(item.get("title"))
+        email = self._clean_email(item.get("email"))
+        raw_phone = (
+            safe_str(item.get("phone"))
+            or safe_str(item.get("telephone"))
+            or safe_str(item.get("mobile"))
         )
         phone = self._clean_phone(raw_phone)
+        location = safe_str(item.get("location"))
+        company_domain = safe_str(item.get("company_domain"))
+        linkedin_url = safe_str(item.get("linkedin_url"))
+
         if self.logger:
             self.logger.debug(
-                f"Formatting: {item.get('full_name')} | "
-                f"raw_phone={item.get('phone')} | "
+                f"Formatting: {full_name} | "
+                f"raw_phone={raw_phone} | "
                 f"cleaned={phone}"
             )
 
@@ -341,16 +476,16 @@ class _FormatterAgent:
             full_name=name,
             first_name=first,
             last_name=last,
-            title=(item.get("title") or "").strip()[:100],
-            company=(item.get("company") or "").strip()[:100],
+            title=title[:100],
+            company=company[:100],
             phone=phone,
             email=email,
             email_confidence="scraped" if email else "",
-            location=(item.get("location") or "").strip()[:100],
+            location=location[:100],
             company_domain=self._clean_domain(
-                item.get("company_domain", "")
+                company_domain
             ),
-            linkedin_url=(item.get("linkedin_url") or "").strip()[:200],
+            linkedin_url=linkedin_url[:200],
             status=LeadStatus.SCRAPED,
         )
         return lead
@@ -397,12 +532,44 @@ class ScraperAgent(BaseAgent):
         self._seen_hashes: set[str] = set()
         self._consecutive_empty: int = 0
         self._raw_pages: list[str] = []
+        self._debug_dir = os.path.join("debug", "runs", self.run.id[:8])
+        os.makedirs(self._debug_dir, exist_ok=True)
 
         self._browser_agent = _BrowserAgent(self.logger)
         self._extractor = _ExtractorAgent(self.logger)
         self._verifier = _VerifierAgent(self.logger)
         self._formatter = _FormatterAgent(self.logger)
         self._storer = _StorageAgent(self.logger)
+
+    def _write_debug(self, filename: str, data) -> None:
+        try:
+            path = os.path.join(self._debug_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                if isinstance(data, str):
+                    f.write(data)
+                else:
+                    json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+        except Exception as exc:
+            self.logger.warning(f"Debug write failed for {filename}: {exc}")
+
+    def _write_page_error(self, page_num: int, raw_text: str, exc: Exception) -> None:
+        raw_response = getattr(self._extractor, "last_raw_response", "")
+        self._write_debug(
+            f"page_{page_num:03d}_error.txt",
+            "\n".join([
+                "EXCEPTION:",
+                str(exc),
+                "",
+                "TRACEBACK:",
+                traceback.format_exc(),
+                "",
+                "RAW_TEXT_FIRST_5000_CHARS:",
+                safe_str(raw_text)[:5000],
+                "",
+                "OPENAI_RAW_RESPONSE:",
+                safe_str(raw_response),
+            ]),
+        )
 
     def _is_sales_navigator(self, url: str) -> bool:
         return "linkedin.com/sales" in url
@@ -500,20 +667,44 @@ class ScraperAgent(BaseAgent):
 
         def process_page(args):
             page_num, raw_text = args
-            self.logger.info(
-                f"Extracting page {page_num}..."
-            )
-            raw_items = self._extractor.extract(raw_text)
-            valid_items, junk = self._verifier.verify(raw_items)
-            formatted = [
-                self._formatter.format(item)
-                for item in valid_items
-            ]
-            self.logger.info(
-                f"Page {page_num}: {len(formatted)} leads "
-                f"({junk} junk)"
-            )
-            return formatted
+            try:
+                self.logger.info(
+                    f"Extracting page {page_num}..."
+                )
+                raw_items = self._extractor.extract(raw_text)
+                self._write_debug(
+                    f"page_{page_num:03d}_openai_raw.json",
+                    raw_items,
+                )
+                valid_items, junk = self._verifier.verify(raw_items)
+                self._write_debug(
+                    f"page_{page_num:03d}_verified.json",
+                    valid_items,
+                )
+                formatted = [
+                    self._formatter.format(item)
+                    for item in valid_items
+                ]
+                self._write_debug(
+                    f"page_{page_num:03d}_final_leads.json",
+                    [lead.to_dict() for lead in formatted],
+                )
+                self.logger.info(
+                    f"Page {page_num}: {len(formatted)} leads "
+                    f"({junk} junk)"
+                )
+                return formatted
+            except Exception as exc:
+                self.logger.exception(
+                    f"Phase 2 extraction failed for page {page_num}: {exc}"
+                )
+                self.emit(EventType.AGENT_FAILED, {
+                    "page": page_num,
+                    "error": str(exc),
+                    "stage": "phase2_extract",
+                })
+                self._write_page_error(page_num, raw_text, exc)
+                return []
 
         all_leads = []
         with concurrent.futures.ThreadPoolExecutor(
@@ -636,6 +827,7 @@ class ScraperAgent(BaseAgent):
                 raw_text = self._browser_agent.wait_for_content(page)
                 if raw_text:
                     self._raw_pages.append(raw_text)
+                    self._write_debug(f"page_{page_num:03d}_raw.txt", raw_text)
                     self.logger.info(
                         f"Page {page_num} copied ({len(raw_text)} chars). "
                         f"Total pages: {len(self._raw_pages)}"
@@ -690,16 +882,40 @@ class ScraperAgent(BaseAgent):
 
         def process_page(args):
             page_num, raw_text = args
-            self.logger.info(f"Extracting page {page_num}...")
-            raw_items = self._extractor.extract(raw_text)
-            valid_items, junk = self._verifier.verify(raw_items)
-            formatted = [
-                self._formatter.format(item) for item in valid_items
-            ]
-            self.logger.info(
-                f"Page {page_num}: {len(formatted)} leads ({junk} junk)"
-            )
-            return formatted
+            try:
+                self.logger.info(f"Extracting page {page_num}...")
+                raw_items = self._extractor.extract(raw_text)
+                self._write_debug(
+                    f"page_{page_num:03d}_openai_raw.json",
+                    raw_items,
+                )
+                valid_items, junk = self._verifier.verify(raw_items)
+                self._write_debug(
+                    f"page_{page_num:03d}_verified.json",
+                    valid_items,
+                )
+                formatted = [
+                    self._formatter.format(item) for item in valid_items
+                ]
+                self._write_debug(
+                    f"page_{page_num:03d}_final_leads.json",
+                    [lead.to_dict() for lead in formatted],
+                )
+                self.logger.info(
+                    f"Page {page_num}: {len(formatted)} leads ({junk} junk)"
+                )
+                return formatted
+            except Exception as exc:
+                self.logger.exception(
+                    f"Phase 2 extraction failed for page {page_num}: {exc}"
+                )
+                self.emit(EventType.AGENT_FAILED, {
+                    "page": page_num,
+                    "error": str(exc),
+                    "stage": "phase2_extract",
+                })
+                self._write_page_error(page_num, raw_text, exc)
+                return []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
             results = list(ex.map(
