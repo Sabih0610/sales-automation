@@ -135,3 +135,165 @@ class PipelineRun:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
         }
+
+
+@dataclass(frozen=False)
+class LeadUniverse:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    name: str = ""
+    campaign_filename: str = ""
+    source_type: str = "sales_navigator"
+    description: str = ""
+    target_leads: int = 0
+    total_scraped: int = 0
+    total_unique: int = 0
+    status: str = "queued"
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=False)
+class LeadSourceSegment:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    universe_id: str = ""
+    campaign_filename: str = ""
+    source_url: str = ""
+    label: str = ""
+    filters_json: str = "{}"
+    expected_count: int = 0
+    scraped_count: int = 0
+    unique_count: int = 0
+    duplicate_count: int = 0
+    status: str = "queued"
+    stop_reason: str = ""
+    last_run_id: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=False)
+class CampaignSequenceStep:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    campaign_filename: str = ""
+    touch_number: int = 1
+    touch_name: str = "Intro"
+    delay_days: int = 0
+    delay_value: int = 0
+    delay_unit: str = "days"
+    delay_type: str = "calendar_days"
+    send_time_mode: str = "same_as_previous"
+    fixed_send_time: str = ""
+    subject_template: str = ""
+    email_body_template: str = ""
+    linkedin_message_template: str = ""
+    is_active: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=False)
+class CampaignSequenceRules:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    campaign_filename: str = ""
+    timezone: str = "Asia/Karachi"
+    mode: str = "review"
+    stop_on_reply: bool = True
+    stop_on_bounce: bool = True
+    stop_on_unsubscribe: bool = True
+    skip_no_email: bool = True
+    skip_weekends: bool = True
+    send_window_start: str = "09:00"
+    send_window_end: str = "17:00"
+    daily_send_limit: int = 50
+    delay_between_sends_seconds: int = 60
+    require_approval_for_touch1: bool = True
+    require_approval_for_followups: bool = True
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=False)
+class OutreachDraft:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    lead_id: str = ""
+    campaign_filename: str = ""
+    touch_number: int = 1
+    subject: str = ""
+    body: str = ""
+    linkedin_message: str = ""
+    status: str = "draft"
+    scheduled_for: Optional[datetime] = None
+    sent_at: Optional[datetime] = None
+    error_message: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=False)
+class LeadSequenceState:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    lead_id: str = ""
+    campaign_filename: str = ""
+    current_touch: int = 0
+    status: str = "not_started"
+    last_touch_sent_at: Optional[datetime] = None
+    next_touch_due_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    stop_reason: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }
+
+
+@dataclass(frozen=False)
+class LeadActivity:
+    id: str = field(default_factory=lambda: uuid4().hex)
+    lead_id: str = ""
+    campaign_filename: str = ""
+    run_id: str = ""
+    activity_type: str = ""
+    title: str = ""
+    description: str = ""
+    metadata_json: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> dict:
+        return {
+            key: value.isoformat() if isinstance(value, datetime) else value
+            for key, value in self.__dict__.items()
+        }

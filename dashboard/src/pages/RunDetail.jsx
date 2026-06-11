@@ -55,12 +55,10 @@ export default function RunDetail() {
     recipient_email: "",
     email_subject: "",
     email_body: "",
-    linkedin_message: "",
   })
   const [composeSaving, setComposeSaving] = useState(false)
   const [composeSending, setComposeSending] = useState(false)
   const [composeResult, setComposeResult] = useState(null)
-  const [activeTab, setActiveTab] = useState("email")
   const [phase, setPhase] = useState("")
   const [personalising, setPersonalising] = useState(false)
   const [sending, setSending] = useState(false)
@@ -76,7 +74,6 @@ export default function RunDetail() {
     email: "",
     email_subject: "",
     email_body: "",
-    linkedin_message: "",
   })
   const [testToEmail, setTestToEmail] = useState("")
   const [draftSaving, setDraftSaving] = useState(false)
@@ -132,7 +129,6 @@ export default function RunDetail() {
       email: draft.email || "",
       email_subject: draft.email_subject || "",
       email_body: draft.email_body || "",
-      linkedin_message: draft.linkedin_message || "",
     })
     setDraftResult(null)
   }
@@ -228,10 +224,8 @@ export default function RunDetail() {
       recipient_email: p.email || "",
       email_subject: p.email_subject || "",
       email_body: p.email_body || "",
-      linkedin_message: p.linkedin_message || "",
     })
     setComposeResult(null)
-    setActiveTab("email")
   }
 
   const handleSaveEdits = async () => {
@@ -799,13 +793,6 @@ export default function RunDetail() {
                     value={draftForm.email_body}
                     onChange={e => setDraftForm(f => ({ ...f, email_body: e.target.value }))} />
                 </div>
-                <div className="form-group">
-                  <div className="form-label">LinkedIn message</div>
-                  <textarea className="form-input" rows={5}
-                    style={{ resize: "vertical", lineHeight: 1.5 }}
-                    value={draftForm.linkedin_message}
-                    onChange={e => setDraftForm(f => ({ ...f, linkedin_message: e.target.value }))} />
-                </div>
                 {selectedDraft.research_summary && (
                   <div className="form-group">
                     <div className="form-label">Research summary</div>
@@ -882,37 +869,7 @@ export default function RunDetail() {
               </div>
 
               <div className="modal-body">
-                <div style={{
-                  display: "flex",
-                  borderBottom: "0.5px solid var(--color-border-tertiary)",
-                  marginBottom: 16,
-                  gap: 0,
-                }}>
-                  {[["email", "Email"], ["linkedin", "LinkedIn message"]].map(([tab, label]) => (
-                    <button key={tab}
-                      onClick={() => setActiveTab(tab)}
-                      style={{
-                        padding: "8px 16px",
-                        border: "none",
-                        background: "none",
-                        fontSize: 13,
-                        fontWeight: activeTab === tab ? 500 : 400,
-                        color: activeTab === tab
-                          ? "var(--purple)"
-                          : "var(--color-text-secondary)",
-                        borderBottom: activeTab === tab
-                          ? "2px solid var(--purple)"
-                          : "2px solid transparent",
-                        cursor: "pointer",
-                        marginBottom: -1,
-                      }}>
-                      {label}
-                    </button>
-                  ))}
-                </div>
-
-                {activeTab === "email" && (
-                  <>
+                <>
                     <div style={{
                       display: "flex",
                       alignItems: "center",
@@ -1027,43 +984,6 @@ export default function RunDetail() {
                       }))}
                     />
                   </>
-                )}
-
-                {activeTab === "linkedin" && (
-                  <div style={{ padding: "0 4px" }}>
-                    <div className="form-label" style={{ marginBottom: 8 }}>
-                      LinkedIn message
-                      <span style={{
-                        marginLeft: 8,
-                        fontSize: 11,
-                        color: composeData.linkedin_message.length > 280
-                          ? "var(--red)" : "var(--color-text-tertiary)"
-                      }}>
-                        {composeData.linkedin_message.length}/280 chars
-                      </span>
-                    </div>
-                    <textarea
-                      style={{
-                        width: "100%",
-                        minHeight: 120,
-                        padding: "12px",
-                        border: "0.5px solid var(--color-border-secondary)",
-                        borderRadius: "var(--radius)",
-                        fontSize: 13,
-                        lineHeight: 1.6,
-                        fontFamily: "inherit",
-                        resize: "vertical",
-                        background: "var(--color-background-primary)",
-                        color: "var(--color-text-primary)",
-                      }}
-                      placeholder="LinkedIn connection message..."
-                      value={composeData.linkedin_message}
-                      onChange={e => setComposeData(d => ({
-                        ...d, linkedin_message: e.target.value
-                      }))}
-                    />
-                  </div>
-                )}
 
                 {composeResult && (
                   <div className={`banner ${composeResult.error ? "red" : "green"}`}
