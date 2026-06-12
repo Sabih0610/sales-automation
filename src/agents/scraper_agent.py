@@ -517,6 +517,28 @@ class _StorageAgent:
             added += 1
         return added
 
+    def mark_saved_duplicates(
+        self,
+        run: PipelineRun,
+        leads: list[Lead],
+    ) -> None:
+        from src.storage import lead_repo
+
+        campaign_filename = (
+            (run.filters or {}).get("campaign_key")
+            or (run.filters or {}).get("campaign")
+            or ""
+        )
+        for lead in leads:
+            try:
+                lead_repo.mark_duplicate_if_any(lead.id, campaign_filename)
+            except Exception as exc:
+                self.logger.warning(
+                    "Duplicate detection failed for lead %s: %s",
+                    lead.id,
+                    exc,
+                )
+
 
 class ScraperAgent(BaseAgent):
     """
@@ -2268,6 +2290,7 @@ el => Boolean(
                     from src.storage import lead_repo
 
                     lead_repo.save_batch(self.run.id, leads)
+                    self._storer.mark_saved_duplicates(self.run, leads)
                     self.logger.info(
                         f"Saved {len(leads)} Sales Navigator leads to DB."
                     )
@@ -2393,6 +2416,7 @@ el => Boolean(
             from src.storage import lead_repo
 
             lead_repo.save_batch(self.run.id, self._leads)
+            self._storer.mark_saved_duplicates(self.run, self._leads)
             self.logger.info(
                 f"Saved {len(self._leads)} leads to DB with all fields."
             )

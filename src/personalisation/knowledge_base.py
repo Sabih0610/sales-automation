@@ -1,6 +1,4 @@
-import json
 import math
-import os
 import pathlib
 import re
 
@@ -8,7 +6,6 @@ from src.personalisation.models import CampaignConfig, KBChunk, RelevantContext
 
 
 KB_DIR = pathlib.Path("knowledge_base")
-CAMPAIGNS_DIR = pathlib.Path("campaigns")
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 50
 TOP_K = 4
@@ -17,40 +14,30 @@ TOP_K = 4
 class KnowledgeBaseLoader:
     @staticmethod
     def load_campaign(campaign_file: str) -> CampaignConfig:
-        """Load campaign JSON config by filename or name."""
-        path = CAMPAIGNS_DIR / campaign_file
-        if not path.exists():
-            for f in CAMPAIGNS_DIR.glob("*.json"):
-                data = json.loads(f.read_text(encoding="utf-8"))
-                if data.get("name") == campaign_file:
-                    path = f
+        """Load campaign config by legacy filename or display name."""
+        from src.storage import campaign_repo
+
+        campaign = campaign_repo.get_by_filename(campaign_file)
+        if not campaign:
+            for item in campaign_repo.list_all():
+                if item.get("name") == campaign_file:
+                    campaign = item
                     break
-        data = json.loads(path.read_text(encoding="utf-8"))
+        if not campaign:
+            raise FileNotFoundError(f"Campaign not found: {campaign_file}")
+        data = {
+            "name": campaign.get("name", ""),
+            "description": campaign.get("description", ""),
+            **(campaign.get("config") or {}),
+        }
         return CampaignConfig(**data)
 
     @staticmethod
     def list_campaigns() -> list[dict]:
         """Return list of all campaign configs as dicts."""
-        campaigns = []
-        for f in CAMPAIGNS_DIR.glob("*.json"):
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                campaigns.append({
-                    "filename": f.name,
-                    "name": data.get("name", f.stem),
-                    "description": data.get("description", ""),
-                    "knowledge_bases": data.get("knowledge_bases", []),
-                    "target_personas": data.get("target_personas", []),
-                    "target_industries": data.get("target_industries", []),
-                    "tone": data.get("tone", ""),
-                    "email_goal": data.get("email_goal", ""),
-                    "max_email_words": data.get("max_email_words", 150),
-                    "max_linkedin_chars": data.get("max_linkedin_chars", 280),
-                    "key_pain_points": data.get("key_pain_points", []),
-                })
-            except Exception:
-                continue
-        return sorted(campaigns, key=lambda c: c["name"])
+        from src.storage import campaign_repo
+
+        return campaign_repo.list_all()
 
     @staticmethod
     def list_kb_files() -> list[str]:

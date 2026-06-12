@@ -214,7 +214,7 @@ class CampaignSequenceRules:
     id: str = field(default_factory=lambda: uuid4().hex)
     campaign_filename: str = ""
     timezone: str = "Asia/Karachi"
-    mode: str = "review"
+    mode: str = "manual"
     stop_on_reply: bool = True
     stop_on_bounce: bool = True
     stop_on_unsubscribe: bool = True

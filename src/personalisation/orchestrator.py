@@ -1,8 +1,5 @@
 import concurrent.futures
-import json
 import logging
-import sqlite3
-from pathlib import Path
 
 from src.models import Lead
 from src.personalisation.agents.context_agent import ContextAgent
@@ -10,32 +7,33 @@ from src.personalisation.agents.web_research_agent import WebResearchAgent
 from src.personalisation.agents.writer_agent import WriterAgent
 from src.personalisation.knowledge_base import KnowledgeBaseLoader
 from src.personalisation.models import (
-    CampaignConfig,
     PersonalisedMessage,
     ResearchResult,
 )
-from src.storage import db, lead_repo
+from src.storage import campaign_sequence_repo, lead_repo
 
 
 def _load_touch_template(campaign_name: str, touch_number: int) -> dict:
-    seq_path = Path("campaigns/sequences.json")
-    if not seq_path.exists():
+    step = campaign_sequence_repo.get_step(
+        campaign_name,
+        touch_number,
+        active_only=False,
+    )
+    if not step:
         return {}
-    try:
-        settings = json.loads(seq_path.read_text(encoding="utf-8"))
-        campaign_settings = settings.get(campaign_name)
-        if not campaign_settings:
-            normalized = campaign_name.replace(".json", "").lower()
-            for key, value in settings.items():
-                if key.replace(".json", "").lower() == normalized:
-                    campaign_settings = value
-                    break
-        for touch in (campaign_settings or {}).get("touches", []):
-            if int(touch.get("number", 0)) == touch_number:
-                return touch
-    except Exception:
-        return {}
-    return {}
+    return {
+        "number": step.touch_number,
+        "name": step.touch_name,
+        "delay_days": step.delay_days,
+        "delay_value": step.delay_value,
+        "delay_unit": step.delay_unit,
+        "delay_type": step.delay_type,
+        "send_time_mode": step.send_time_mode,
+        "fixed_send_time": step.fixed_send_time,
+        "subject_template": step.subject_template,
+        "email_body_template": step.email_body_template,
+        "linkedin_message_template": step.linkedin_message_template,
+    }
 
 
 class PersonalisationOrchestrator:
@@ -49,33 +47,6 @@ class PersonalisationOrchestrator:
 
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
-        self._ensure_db_columns()
-
-    def _ensure_db_columns(self) -> None:
-        """
-        Add Phase 2 columns to leads table if they don't exist.
-        Safe to run multiple times - uses ALTER TABLE IF NOT EXISTS pattern.
-        """
-        new_columns = [
-            ("email_subject", "TEXT DEFAULT ''"),
-            ("email_body", "TEXT DEFAULT ''"),
-            ("linkedin_message", "TEXT DEFAULT ''"),
-            ("research_summary", "TEXT DEFAULT ''"),
-            ("personalised_at", "TEXT DEFAULT ''"),
-            ("campaign_name", "TEXT DEFAULT ''"),
-        ]
-        conn = db._conn()
-        existing = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(leads)").fetchall()
-        }
-        for col_name, col_def in new_columns:
-            if col_name not in existing:
-                conn.execute(
-                    f"ALTER TABLE leads ADD COLUMN {col_name} {col_def}"
-                )
-                conn.commit()
-                self.logger.info(f"Added column: {col_name}")
 
     def _save_message(
         self,
@@ -88,30 +59,14 @@ class PersonalisationOrchestrator:
                 f"Skipping save for {message.lead_id}: {message.error}"
             )
             return
-        from datetime import datetime
-
-        with db._conn() as conn:
-            conn.execute(
-                """
-                UPDATE leads SET
-                    email_subject = ?,
-                    email_body = ?,
-                    linkedin_message = ?,
-                    research_summary = ?,
-                    personalised_at = ?,
-                    campaign_name = ?
-                WHERE id = ?
-                """,
-                (
-                    message.email_subject,
-                    message.email_body,
-                    message.linkedin_message,
-                    message.research_summary,
-                    datetime.utcnow().isoformat(),
-                    message.campaign_name,
-                    message.lead_id,
-                ),
-            )
+        lead_repo.save_personalised_message(
+            message.lead_id,
+            message.email_subject,
+            message.email_body,
+            message.linkedin_message,
+            message.research_summary,
+            message.campaign_name,
+        )
 
     def _personalise_one(
         self,

@@ -1,9 +1,12 @@
 ##src\storage.py
 import contextlib
 import json
+import re
 import sqlite3
 import threading
-
+from uuid import uuid4
+from datetime import date, timedelta
+from src.campaign_config import validate_campaign_config
 from src.config import settings
 from src.models import (
     AgentEvent,
@@ -24,6 +27,7 @@ from src.models import (
     Segment,
     datetime,
 )
+from src.sequence_modes import normalize_sequence_mode
 
 
 def _dt_to_text(value: datetime | None) -> str | None:
@@ -38,264 +42,74 @@ def _text_to_dt(value: str | None) -> datetime | None:
     return None
 
 
+STOPPED_SEQUENCE_STATUSES = {
+    "replied",
+    "bounced",
+    "unsubscribed",
+    "do_not_contact",
+    "completed",
+    "skipped",
+}
+
+
+def _normalize_campaign(value: str) -> str:
+    return (
+        (value or "")
+        .replace(".json", "")
+        .replace("_", " ")
+        .lower()
+        .strip()
+    )
+
+
+def _match_campaign(run_campaign: str, target: str) -> bool:
+    current = _normalize_campaign(run_campaign)
+    expected = _normalize_campaign(target)
+    if not current or not expected:
+        return False
+    return current == expected or current in expected or expected in current
+
+
+def _campaign_run_ids(
+    conn: sqlite3.Connection,
+    campaign_filename: str,
+) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT id, filters
+        FROM pipeline_runs
+        ORDER BY started_at DESC
+        """
+    ).fetchall()
+    ids = []
+    for row in rows:
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            filters = json.loads(row["filters"] or "{}")
+            run_campaign = (
+                filters.get("campaign_key")
+                or filters.get("campaign")
+                or ""
+            )
+            if _match_campaign(run_campaign, campaign_filename):
+                ids.append(row["id"])
+    return ids
+
+
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._local = threading.local()
-        self._init_schema()
+        from src.migrations_runner import apply_migrations
 
-    def _conn(self) -> sqlite3.Connection:
+        apply_migrations(self.conn())
+
+    def conn(self) -> sqlite3.Connection:
+        # internal use only
         if not hasattr(self._local, "conn") or self._local.conn is None:
             self._local.conn = sqlite3.connect(self.db_path)
             self._local.conn.row_factory = sqlite3.Row
             self._local.conn.execute("PRAGMA journal_mode=WAL")
         return self._local.conn
-
-    def _init_schema(self) -> None:
-        with self._conn() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS pipeline_runs (
-                    id TEXT PRIMARY KEY,
-                    status TEXT, filters TEXT, enrichment_mode TEXT,
-                    total_scraped INT DEFAULT 0, total_enriched INT DEFAULT 0,
-                    total_warm INT DEFAULT 0, total_cold INT DEFAULT 0,
-                    total_no_email INT DEFAULT 0, total_exported INT DEFAULT 0,
-                    error TEXT DEFAULT '', started_at TEXT, completed_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS leads (
-                    id TEXT PRIMARY KEY, run_id TEXT,
-                    full_name TEXT, first_name TEXT, last_name TEXT,
-                    title TEXT, company TEXT, company_domain TEXT,
-                    location TEXT, linkedin_url TEXT, company_linkedin_url TEXT,
-                    email TEXT, email_confidence TEXT, phone TEXT,
-                    intent_score REAL DEFAULT 0, segment TEXT, status TEXT,
-                    created_at TEXT, updated_at TEXT,
-                    FOREIGN KEY(run_id) REFERENCES pipeline_runs(id)
-                );
-                CREATE TABLE IF NOT EXISTS agent_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT, event_type TEXT, agent_name TEXT,
-                    payload TEXT, error TEXT, timestamp TEXT
-                );
-                CREATE TABLE IF NOT EXISTS run_checkpoints (
-                    run_id TEXT PRIMARY KEY,
-                    last_page INT DEFAULT 0,
-                    leads_collected INT DEFAULT 0,
-                    updated_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS lead_universes (
-                    id TEXT PRIMARY KEY,
-                    name TEXT,
-                    campaign_filename TEXT,
-                    source_type TEXT DEFAULT 'sales_navigator',
-                    description TEXT DEFAULT '',
-                    target_leads INT DEFAULT 0,
-                    total_scraped INT DEFAULT 0,
-                    total_unique INT DEFAULT 0,
-                    status TEXT DEFAULT 'queued',
-                    created_at TEXT,
-                    updated_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS lead_source_segments (
-                    id TEXT PRIMARY KEY,
-                    universe_id TEXT,
-                    campaign_filename TEXT,
-                    source_url TEXT,
-                    label TEXT,
-                    filters_json TEXT DEFAULT '{}',
-                    expected_count INT DEFAULT 0,
-                    scraped_count INT DEFAULT 0,
-                    unique_count INT DEFAULT 0,
-                    duplicate_count INT DEFAULT 0,
-                    status TEXT DEFAULT 'queued',
-                    stop_reason TEXT DEFAULT '',
-                    last_run_id TEXT DEFAULT '',
-                    created_at TEXT,
-                    updated_at TEXT,
-                    FOREIGN KEY(universe_id) REFERENCES lead_universes(id)
-                );
-                CREATE TABLE IF NOT EXISTS campaign_sequence_steps (
-                    id TEXT PRIMARY KEY,
-                    campaign_filename TEXT NOT NULL,
-                    touch_number INT NOT NULL,
-                    touch_name TEXT DEFAULT '',
-                    delay_days INT DEFAULT 0,
-                    delay_value INT DEFAULT 0,
-                    delay_unit TEXT DEFAULT 'days',
-                    delay_type TEXT DEFAULT 'calendar_days',
-                    send_time_mode TEXT DEFAULT 'same_as_previous',
-                    fixed_send_time TEXT DEFAULT '',
-                    subject_template TEXT DEFAULT '',
-                    email_body_template TEXT DEFAULT '',
-                    linkedin_message_template TEXT DEFAULT '',
-                    is_active INT DEFAULT 1,
-                    created_at TEXT,
-                    updated_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS campaign_sequence_rules (
-                    id TEXT PRIMARY KEY,
-                    campaign_filename TEXT NOT NULL UNIQUE,
-                    timezone TEXT DEFAULT 'Asia/Karachi',
-                    mode TEXT DEFAULT 'review',
-                    stop_on_reply INT DEFAULT 1,
-                    stop_on_bounce INT DEFAULT 1,
-                    stop_on_unsubscribe INT DEFAULT 1,
-                    skip_no_email INT DEFAULT 1,
-                    skip_weekends INT DEFAULT 1,
-                    send_window_start TEXT DEFAULT '09:00',
-                    send_window_end TEXT DEFAULT '17:00',
-                    daily_send_limit INT DEFAULT 50,
-                    delay_between_sends_seconds INT DEFAULT 60,
-                    require_approval_for_touch1 INT DEFAULT 1,
-                    require_approval_for_followups INT DEFAULT 1,
-                    created_at TEXT,
-                    updated_at TEXT
-                );
-                CREATE TABLE IF NOT EXISTS outreach_drafts (
-                    id TEXT PRIMARY KEY,
-                    lead_id TEXT NOT NULL,
-                    campaign_filename TEXT NOT NULL,
-                    touch_number INT NOT NULL,
-                    subject TEXT DEFAULT '',
-                    body TEXT DEFAULT '',
-                    linkedin_message TEXT DEFAULT '',
-                    status TEXT DEFAULT 'draft',
-                    scheduled_for TEXT,
-                    sent_at TEXT,
-                    error_message TEXT DEFAULT '',
-                    created_at TEXT,
-                    updated_at TEXT,
-                    FOREIGN KEY(lead_id) REFERENCES leads(id)
-                );
-                CREATE TABLE IF NOT EXISTS lead_sequence_state (
-                    id TEXT PRIMARY KEY,
-                    lead_id TEXT NOT NULL,
-                    campaign_filename TEXT NOT NULL,
-                    current_touch INT DEFAULT 0,
-                    status TEXT DEFAULT 'not_started',
-                    last_touch_sent_at TEXT,
-                    next_touch_due_at TEXT,
-                    completed_at TEXT,
-                    stop_reason TEXT DEFAULT '',
-                    created_at TEXT,
-                    updated_at TEXT,
-                    FOREIGN KEY(lead_id) REFERENCES leads(id)
-                );
-                CREATE TABLE IF NOT EXISTS lead_activities (
-                    id TEXT PRIMARY KEY,
-                    lead_id TEXT NOT NULL,
-                    campaign_filename TEXT NOT NULL,
-                    run_id TEXT DEFAULT '',
-                    activity_type TEXT NOT NULL,
-                    title TEXT DEFAULT '',
-                    description TEXT DEFAULT '',
-                    metadata_json TEXT DEFAULT '',
-                    created_at TEXT,
-                    FOREIGN KEY(lead_id) REFERENCES leads(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_leads_run ON leads(run_id);
-                CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
-                CREATE INDEX IF NOT EXISTS idx_segments_universe
-                    ON lead_source_segments(universe_id);
-                CREATE INDEX IF NOT EXISTS idx_universes_campaign
-                    ON lead_universes(campaign_filename);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_sequence_steps_campaign_touch
-                    ON campaign_sequence_steps(campaign_filename, touch_number);
-                CREATE INDEX IF NOT EXISTS idx_outreach_drafts_campaign
-                    ON outreach_drafts(campaign_filename, status, touch_number);
-                CREATE INDEX IF NOT EXISTS idx_outreach_drafts_lead
-                    ON outreach_drafts(lead_id, campaign_filename, touch_number);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_active_outreach_draft
-                    ON outreach_drafts(lead_id, campaign_filename, touch_number)
-                    WHERE status NOT IN ('failed', 'skipped');
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_lead_sequence_state
-                    ON lead_sequence_state(lead_id, campaign_filename);
-                CREATE INDEX IF NOT EXISTS idx_lead_sequence_due
-                    ON lead_sequence_state(campaign_filename, status, next_touch_due_at);
-                CREATE INDEX IF NOT EXISTS idx_lead_activities_campaign
-                    ON lead_activities(campaign_filename, created_at);
-                CREATE INDEX IF NOT EXISTS idx_lead_activities_lead
-                    ON lead_activities(lead_id, campaign_filename, created_at);
-                """
-            )
-            draft_columns = [
-                ("email_subject", "TEXT DEFAULT ''"),
-                ("email_body", "TEXT DEFAULT ''"),
-                ("linkedin_message", "TEXT DEFAULT ''"),
-                ("research_summary", "TEXT DEFAULT ''"),
-                ("campaign_name", "TEXT DEFAULT ''"),
-                ("personalised_at", "TEXT"),
-                ("email_sequence_status", "TEXT DEFAULT 'not_started'"),
-                ("day1_sent_at", "TEXT"),
-                ("day3_sent_at", "TEXT"),
-                ("day7_sent_at", "TEXT"),
-                ("email_sequence_error", "TEXT DEFAULT ''"),
-            ]
-            existing = {
-                row[1]
-                for row in conn.execute("PRAGMA table_info(leads)").fetchall()
-            }
-            lead_source_columns = [
-                ("lead_universe_id", "TEXT DEFAULT ''"),
-                ("lead_source_segment_id", "TEXT DEFAULT ''"),
-            ]
-            for col_name, col_def in lead_source_columns:
-                if col_name not in existing:
-                    conn.execute(
-                        f"ALTER TABLE leads ADD COLUMN {col_name} {col_def}"
-                    )
-                    existing.add(col_name)
-            for col_name, col_def in draft_columns:
-                if col_name not in existing:
-                    conn.execute(
-                        f"ALTER TABLE leads ADD COLUMN {col_name} {col_def}"
-                    )
-            sequence_step_columns = [
-                ("delay_value", "INT DEFAULT 0"),
-                ("delay_unit", "TEXT DEFAULT 'days'"),
-                ("delay_type", "TEXT DEFAULT 'calendar_days'"),
-                ("send_time_mode", "TEXT DEFAULT 'same_as_previous'"),
-                ("fixed_send_time", "TEXT DEFAULT ''"),
-            ]
-            existing_steps = {
-                row[1]
-                for row in conn.execute(
-                    "PRAGMA table_info(campaign_sequence_steps)"
-                ).fetchall()
-            }
-            for col_name, col_def in sequence_step_columns:
-                if col_name not in existing_steps:
-                    conn.execute(
-                        f"ALTER TABLE campaign_sequence_steps ADD COLUMN {col_name} {col_def}"
-                    )
-                    existing_steps.add(col_name)
-            conn.execute(
-                """
-                UPDATE campaign_sequence_steps
-                SET delay_value = COALESCE(NULLIF(delay_value, 0), delay_days),
-                    delay_unit = COALESCE(NULLIF(delay_unit, ''), 'days'),
-                    delay_type = COALESCE(NULLIF(delay_type, ''), 'calendar_days'),
-                    send_time_mode = COALESCE(NULLIF(send_time_mode, ''), 'same_as_previous')
-                """
-            )
-            sequence_rule_columns = [
-                ("timezone", "TEXT DEFAULT 'Asia/Karachi'"),
-                ("mode", "TEXT DEFAULT 'review'"),
-                ("require_approval_for_touch1", "INT DEFAULT 1"),
-                ("require_approval_for_followups", "INT DEFAULT 1"),
-            ]
-            existing_rules = {
-                row[1]
-                for row in conn.execute(
-                    "PRAGMA table_info(campaign_sequence_rules)"
-                ).fetchall()
-            }
-            for col_name, col_def in sequence_rule_columns:
-                if col_name not in existing_rules:
-                    conn.execute(
-                        f"ALTER TABLE campaign_sequence_rules ADD COLUMN {col_name} {col_def}"
-                    )
 
 
 class RunRepository:
@@ -303,7 +117,7 @@ class RunRepository:
         self.db = db
 
     def save(self, run: PipelineRun) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO pipeline_runs (
@@ -331,7 +145,7 @@ class RunRepository:
             )
 
     def get(self, run_id: str) -> Optional[PipelineRun]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             "SELECT * FROM pipeline_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -340,10 +154,25 @@ class RunRepository:
         return self._row_to_run(row)
 
     def list_all(self) -> list[PipelineRun]:
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             "SELECT * FROM pipeline_runs ORDER BY started_at DESC"
         ).fetchall()
         return [self._row_to_run(row) for row in rows]
+
+    def count_all(self) -> int:
+        row = self.db.conn().execute(
+            "SELECT COUNT(*) AS total FROM pipeline_runs"
+        ).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def ids_for_campaign(self, campaign_filename: str) -> list[str]:
+        return _campaign_run_ids(self.db.conn(), campaign_filename)
+
+    def list_for_campaign(self, campaign_filename: str) -> list[PipelineRun]:
+        ids = set(self.ids_for_campaign(campaign_filename))
+        if not ids:
+            return []
+        return [run for run in self.list_all() if run.id in ids]
 
     def update_status(
         self,
@@ -351,7 +180,7 @@ class RunRepository:
         status: RunStatus,
         error: str = "",
     ) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 UPDATE pipeline_runs
@@ -367,7 +196,7 @@ class RunRepository:
         last_page: int,
         leads_collected: int,
     ) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO run_checkpoints (
@@ -384,7 +213,7 @@ class RunRepository:
             )
 
     def get_checkpoint(self, run_id: str) -> Optional[dict]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT last_page, leads_collected
             FROM run_checkpoints
@@ -423,7 +252,7 @@ class LeadUniverseRepository:
 
     def save_universe(self, universe: LeadUniverse) -> None:
         universe.updated_at = datetime.utcnow()
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO lead_universes (
@@ -449,7 +278,7 @@ class LeadUniverseRepository:
             )
 
     def get_universe(self, universe_id: str) -> Optional[LeadUniverse]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             "SELECT * FROM lead_universes WHERE id = ?",
             (universe_id,),
         ).fetchone()
@@ -461,7 +290,7 @@ class LeadUniverseRepository:
         if campaign_filename:
             where = "WHERE campaign_filename = ?"
             params.append(campaign_filename)
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             f"""
             SELECT * FROM lead_universes
             {where}
@@ -473,7 +302,7 @@ class LeadUniverseRepository:
 
     def save_segment(self, segment: LeadSourceSegment) -> None:
         segment.updated_at = datetime.utcnow()
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO lead_source_segments (
@@ -504,14 +333,14 @@ class LeadUniverseRepository:
             )
 
     def get_segment(self, segment_id: str) -> Optional[LeadSourceSegment]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             "SELECT * FROM lead_source_segments WHERE id = ?",
             (segment_id,),
         ).fetchone()
         return self._row_to_segment(row) if row else None
 
     def list_segments(self, universe_id: str) -> list[LeadSourceSegment]:
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             """
             SELECT * FROM lead_source_segments
             WHERE universe_id = ?
@@ -522,7 +351,7 @@ class LeadUniverseRepository:
         return [self._row_to_segment(row) for row in rows]
 
     def list_segments_for_campaign(self, campaign_filename: str) -> list[LeadSourceSegment]:
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             """
             SELECT * FROM lead_source_segments
             WHERE campaign_filename = ?
@@ -532,8 +361,19 @@ class LeadUniverseRepository:
         ).fetchall()
         return [self._row_to_segment(row) for row in rows]
 
+    def segment_for_run(self, run_id: str) -> dict | None:
+        row = self.db.conn().execute(
+            """
+            SELECT id, label
+            FROM lead_source_segments
+            WHERE last_run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def next_queued_segment(self, universe_id: str) -> Optional[LeadSourceSegment]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT * FROM lead_source_segments
             WHERE universe_id = ? AND status = 'queued'
@@ -551,7 +391,7 @@ class LeadUniverseRepository:
         stop_reason: str = "",
         last_run_id: str = "",
     ) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 UPDATE lead_source_segments
@@ -580,7 +420,7 @@ class LeadUniverseRepository:
         stop_reason: str,
         last_run_id: str,
     ) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 UPDATE lead_source_segments
@@ -606,7 +446,7 @@ class LeadUniverseRepository:
             )
 
     def pause_queued_segments(self, universe_id: str) -> int:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE lead_source_segments
@@ -620,7 +460,7 @@ class LeadUniverseRepository:
             return cur.rowcount
 
     def refresh_universe_totals(self, universe_id: str) -> None:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT
                 COALESCE(SUM(scraped_count), 0) AS scraped,
@@ -643,7 +483,7 @@ class LeadUniverseRepository:
             status = "blocked"
         elif row["total"]:
             status = "completed"
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 UPDATE lead_universes
@@ -663,7 +503,7 @@ class LeadUniverseRepository:
             )
 
     def campaign_coverage(self, campaign_filename: str) -> dict:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT
                 COUNT(*) AS total_segments,
@@ -729,13 +569,193 @@ def _int_to_bool(value) -> bool:
     return bool(int(value or 0))
 
 
+class CampaignRepo:
+    CONFIG_FIELDS = {
+        "knowledge_bases",
+        "target_personas",
+        "target_industries",
+        "tone",
+        "max_email_words",
+        "max_linkedin_chars",
+        "email_goal",
+        "key_pain_points",
+    }
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def _normalize_filename(self, filename: str) -> str:
+        value = (filename or "").strip()
+        if not value:
+            return ""
+        return value if value.endswith(".json") else f"{value}.json"
+
+    def _slug(self, name: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+        return slug or "campaign"
+
+    def _unique_filename(self, name: str) -> str:
+        base = self._slug(name)
+        candidate = f"{base}.json"
+        index = 2
+        while self.get_by_filename(candidate):
+            candidate = f"{base}_{index}.json"
+            index += 1
+        return candidate
+
+    def _row_to_campaign(self, row: sqlite3.Row | None) -> dict | None:
+        if not row:
+            return None
+        try:
+            config = json.loads(row["config"] or "{}")
+        except json.JSONDecodeError:
+            config = {}
+        data = {
+            "id": row["id"],
+            "filename": row["filename"] or "",
+            "name": row["name"] or "",
+            "description": row["description"] or "",
+            "config": config,
+            "created_at": row["created_at"] or "",
+            "updated_at": row["updated_at"] or "",
+        }
+        data.update(config)
+        return data
+
+    def _file_parts(self, filename: str, data: dict) -> tuple[str, str, dict]:
+        name = str(data.get("name") or filename.replace(".json", "")).strip()
+        description = str(data.get("description") or "").strip()
+        config = {
+            key: value
+            for key, value in data.items()
+            if key not in {"name", "description"}
+        }
+        return name, description, config
+
+    def _validate_config(self, config: dict | None) -> dict:
+        return validate_campaign_config(config)
+
+    def get_by_filename(self, filename: str) -> dict | None:
+        normalized = self._normalize_filename(filename)
+        row = self.db.conn().execute(
+            """
+            SELECT *
+            FROM campaigns
+            WHERE filename = ?
+            """,
+            (normalized,),
+        ).fetchone()
+        return self._row_to_campaign(row)
+
+    def get_by_id(self, campaign_id: str) -> dict | None:
+        row = self.db.conn().execute(
+            """
+            SELECT *
+            FROM campaigns
+            WHERE id = ?
+            """,
+            (campaign_id,),
+        ).fetchone()
+        return self._row_to_campaign(row)
+
+    def list_all(self) -> list[dict]:
+        rows = self.db.conn().execute(
+            """
+            SELECT *
+            FROM campaigns
+            ORDER BY name ASC
+            """
+        ).fetchall()
+        return [
+            campaign
+            for campaign in (self._row_to_campaign(row) for row in rows)
+            if campaign
+        ]
+
+    def create(
+        self,
+        name: str,
+        description: str = "",
+        config: dict | None = None,
+    ) -> dict:
+        config = self._validate_config(config)
+        filename = self._unique_filename(name)
+        campaign_id = uuid4().hex
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO campaigns (
+                    id, filename, name, description, config,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    campaign_id,
+                    filename,
+                    name,
+                    description or "",
+                    json.dumps(config, default=str),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_by_id(campaign_id)
+
+    def update_config(self, filename: str, config: dict) -> dict | None:
+        config = self._validate_config(config)
+        normalized = self._normalize_filename(filename)
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE campaigns
+                SET config = ?,
+                    updated_at = ?
+                WHERE filename = ?
+                """,
+                (json.dumps(config or {}, default=str), now, normalized),
+            )
+        return self.get_by_filename(normalized)
+
+    def upsert_from_file(self, filename: str, data: dict) -> dict:
+        normalized = self._normalize_filename(filename)
+        name, description, config = self._file_parts(normalized, data or {})
+        config = self._validate_config(config)
+        existing = self.get_by_filename(normalized)
+        now = _dt_to_text(datetime.utcnow())
+        campaign_id = existing["id"] if existing else uuid4().hex
+        created_at = existing.get("created_at") if existing else now
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO campaigns (
+                    id, filename, name, description, config,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    campaign_id,
+                    normalized,
+                    name,
+                    description,
+                    json.dumps(config, default=str),
+                    created_at or now,
+                    now,
+                ),
+            )
+        return self.get_by_filename(normalized)
+
+
 class CampaignSequenceRepository:
     def __init__(self, db: Database):
         self.db = db
 
     def save_step(self, step: CampaignSequenceStep) -> None:
         step.updated_at = datetime.utcnow()
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO campaign_sequence_steps (
@@ -784,6 +804,30 @@ class CampaignSequenceRepository:
                 ),
             )
 
+    def deactivate_missing_steps(
+        self,
+        campaign_filename: str,
+        touch_numbers: list[int],
+    ) -> None:
+        if not touch_numbers:
+            return
+        placeholders = ",".join("?" for _ in touch_numbers)
+        with self.db.conn() as conn:
+            conn.execute(
+                f"""
+                UPDATE campaign_sequence_steps
+                SET is_active = 0,
+                    updated_at = ?
+                WHERE campaign_filename = ?
+                  AND touch_number NOT IN ({placeholders})
+                """,
+                [
+                    datetime.utcnow().isoformat(),
+                    campaign_filename,
+                    *touch_numbers,
+                ],
+            )
+
     def list_steps(
         self,
         campaign_filename: str,
@@ -793,7 +837,7 @@ class CampaignSequenceRepository:
         params: list = [campaign_filename]
         if active_only:
             where += " AND is_active = 1"
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             f"""
             SELECT * FROM campaign_sequence_steps
             WHERE {where}
@@ -813,7 +857,7 @@ class CampaignSequenceRepository:
         params: list = [campaign_filename, touch_number]
         if active_only:
             where += " AND is_active = 1"
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             f"SELECT * FROM campaign_sequence_steps WHERE {where}",
             params,
         ).fetchone()
@@ -821,7 +865,8 @@ class CampaignSequenceRepository:
 
     def save_rules(self, rules: CampaignSequenceRules) -> None:
         rules.updated_at = datetime.utcnow()
-        with self.db._conn() as conn:
+        rules.mode = normalize_sequence_mode(rules.mode)
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO campaign_sequence_rules (
@@ -873,7 +918,7 @@ class CampaignSequenceRepository:
         self,
         campaign_filename: str,
     ) -> Optional[CampaignSequenceRules]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT * FROM campaign_sequence_rules
             WHERE campaign_filename = ?
@@ -889,11 +934,14 @@ class CampaignSequenceRepository:
     ) -> tuple[list[CampaignSequenceStep], CampaignSequenceRules]:
         steps = self.list_steps(campaign_filename)
         if not steps:
-            defaults = default_steps or [
-                {"number": 1, "name": "Intro", "delay_days": 0},
-                {"number": 2, "name": "Follow-up", "delay_days": 3},
-                {"number": 3, "name": "Final touch", "delay_days": 4},
-            ]
+            if default_steps is None:
+                defaults = [
+                    {"number": 1, "name": "Intro", "delay_days": 0},
+                    {"number": 2, "name": "Follow-up", "delay_days": 3},
+                    {"number": 3, "name": "Final touch", "delay_days": 4},
+                ]
+            else:
+                defaults = default_steps
             for item in defaults:
                 self.save_step(CampaignSequenceStep(
                     campaign_filename=campaign_filename,
@@ -946,7 +994,7 @@ class CampaignSequenceRepository:
             id=row["id"],
             campaign_filename=row["campaign_filename"] or "",
             timezone=row["timezone"] or "Asia/Karachi",
-            mode=row["mode"] or "review",
+            mode=normalize_sequence_mode(row["mode"]),
             stop_on_reply=_int_to_bool(row["stop_on_reply"]),
             stop_on_bounce=_int_to_bool(row["stop_on_bounce"]),
             stop_on_unsubscribe=_int_to_bool(row["stop_on_unsubscribe"]),
@@ -971,7 +1019,7 @@ class OutreachRepository:
 
     def save_draft(self, draft: OutreachDraft) -> None:
         draft.updated_at = datetime.utcnow()
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO outreach_drafts (
@@ -999,7 +1047,7 @@ class OutreachRepository:
             )
 
     def get_draft(self, draft_id: str) -> Optional[OutreachDraft]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             "SELECT * FROM outreach_drafts WHERE id = ?",
             (draft_id,),
         ).fetchone()
@@ -1009,7 +1057,7 @@ class OutreachRepository:
         if not draft_ids:
             return []
         placeholders = ",".join("?" for _ in draft_ids)
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             f"""
             SELECT * FROM outreach_drafts
             WHERE id IN ({placeholders})
@@ -1025,7 +1073,7 @@ class OutreachRepository:
         campaign_filename: str,
         touch_number: int,
     ) -> Optional[OutreachDraft]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT * FROM outreach_drafts
             WHERE lead_id = ?
@@ -1060,7 +1108,7 @@ class OutreachRepository:
             where.append("d.lead_id = ?")
             params.append(lead_id)
         params.extend([limit, offset])
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             f"""
             SELECT
                 d.id AS draft_id, d.lead_id, d.campaign_filename,
@@ -1107,7 +1155,7 @@ class OutreachRepository:
             for value in updates.values()
         ]
         values.append(draft_id)
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 f"UPDATE outreach_drafts SET {set_clause} WHERE id = ?",
                 values,
@@ -1116,7 +1164,7 @@ class OutreachRepository:
 
     def count_sent_today(self, campaign_filename: str) -> int:
         today = datetime.utcnow().date().isoformat()
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT COUNT(*) AS total
             FROM outreach_drafts
@@ -1134,7 +1182,7 @@ class OutreachRepository:
         campaign_filename: str,
         reason: str,
     ) -> int:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             cur = conn.execute(
                 """
                 UPDATE outreach_drafts
@@ -1159,7 +1207,7 @@ class OutreachRepository:
         lead_id: str,
         campaign_filename: str,
     ) -> Optional[LeadSequenceState]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             """
             SELECT * FROM lead_sequence_state
             WHERE lead_id = ? AND campaign_filename = ?
@@ -1168,13 +1216,24 @@ class OutreachRepository:
         ).fetchone()
         return self._row_to_state(row) if row else None
 
+    def list_states_for_lead(self, lead_id: str) -> list[LeadSequenceState]:
+        rows = self.db.conn().execute(
+            """
+            SELECT * FROM lead_sequence_state
+            WHERE lead_id = ?
+            ORDER BY created_at ASC
+            """,
+            (lead_id,),
+        ).fetchall()
+        return [self._row_to_state(row) for row in rows]
+
     def upsert_state(self, state: LeadSequenceState) -> None:
         existing = self.get_state(state.lead_id, state.campaign_filename)
         if existing:
             state.id = existing.id
             state.created_at = existing.created_at
         state.updated_at = datetime.utcnow()
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO lead_sequence_state (
@@ -1215,7 +1274,7 @@ class OutreachRepository:
         return state
 
     def add_activity(self, activity: LeadActivity) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT INTO lead_activities (
@@ -1249,7 +1308,7 @@ class OutreachRepository:
             where.append("campaign_filename = ?")
             params.append(campaign_filename)
         params.append(limit)
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             f"""
             SELECT * FROM lead_activities
             WHERE {" AND ".join(where)}
@@ -1265,7 +1324,7 @@ class OutreachRepository:
         campaign_filename: str,
         limit: int = 100,
     ) -> list[dict]:
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             """
             SELECT a.*, l.full_name, l.company, l.email
             FROM lead_activities a
@@ -1277,6 +1336,345 @@ class OutreachRepository:
             (campaign_filename, limit),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_states_by_status(self, status: str) -> int:
+        row = self.db.conn().execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM lead_sequence_state
+            WHERE status = ?
+            """,
+            (status,),
+        ).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def recent_activities(self, limit: int = 15) -> list[dict]:
+        rows = self.db.conn().execute(
+            """
+            SELECT
+                a.activity_type,
+                a.title,
+                a.created_at,
+                a.campaign_filename,
+                l.full_name AS lead_name
+            FROM lead_activities a
+            LEFT JOIN leads l ON l.id = a.lead_id
+            ORDER BY a.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def campaign_overview_counts(self, campaign_filename: str) -> dict:
+        draft_rows = self.db.conn().execute(
+            """
+            SELECT status, COUNT(*) AS total
+            FROM outreach_drafts
+            WHERE campaign_filename = ?
+            GROUP BY status
+            """,
+            (campaign_filename,),
+        ).fetchall()
+        draft_counts = {
+            row["status"] or "draft": row["total"] or 0
+            for row in draft_rows
+        }
+        draft_total_row = self.db.conn().execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM outreach_drafts
+            WHERE campaign_filename = ?
+            """,
+            (campaign_filename,),
+        ).fetchone()
+        unique_row = self.db.conn().execute(
+            """
+            SELECT
+                COUNT(DISTINCT lead_id) AS drafted,
+                COUNT(DISTINCT CASE WHEN status = 'approved' THEN lead_id END) AS approved,
+                COUNT(DISTINCT CASE WHEN status = 'sent' THEN lead_id END) AS sent
+            FROM outreach_drafts
+            WHERE campaign_filename = ?
+            """,
+            (campaign_filename,),
+        ).fetchone()
+        state_rows = self.db.conn().execute(
+            """
+            SELECT status, COUNT(*) AS total
+            FROM lead_sequence_state
+            WHERE campaign_filename = ?
+            GROUP BY status
+            """,
+            (campaign_filename,),
+        ).fetchall()
+        return {
+            "draft_counts": {
+                key: int(value or 0)
+                for key, value in draft_counts.items()
+            },
+            "drafts_generated": int(draft_total_row["total"] or 0)
+            if draft_total_row else 0,
+            "drafted_unique": int(unique_row["drafted"] or 0)
+            if unique_row else 0,
+            "approved_unique": int(unique_row["approved"] or 0)
+            if unique_row else 0,
+            "sent_unique": int(unique_row["sent"] or 0)
+            if unique_row else 0,
+            "state_counts": {
+                row["status"] or "not_started": int(row["total"] or 0)
+                for row in state_rows
+            },
+        }
+
+    def queue_waiting_items(self, campaign_filename: str) -> list[dict]:
+        now_text = datetime.utcnow().isoformat()
+        rows = self.db.conn().execute(
+            """
+            SELECT s.*, l.full_name, l.company, l.title, l.email
+            FROM lead_sequence_state s
+            JOIN leads l ON l.id = s.lead_id
+            WHERE s.campaign_filename = ?
+              AND s.status = 'waiting_followup'
+              AND (
+                s.next_touch_due_at IS NULL
+                OR s.next_touch_due_at > ?
+              )
+            ORDER BY s.next_touch_due_at ASC
+            LIMIT 1000
+            """,
+            (campaign_filename, now_text),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def queue_stopped_items(self, campaign_filename: str) -> list[dict]:
+        rows = self.db.conn().execute(
+            """
+            SELECT s.*, l.full_name, l.company, l.title, l.email
+            FROM lead_sequence_state s
+            JOIN leads l ON l.id = s.lead_id
+            WHERE s.campaign_filename = ?
+              AND s.status IN ('replied', 'bounced', 'unsubscribed', 'do_not_contact', 'skipped')
+            ORDER BY s.updated_at DESC
+            LIMIT 1000
+            """,
+            (campaign_filename,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def latest_draft_for_touch(
+        self,
+        lead_id: str,
+        campaign_filename: str,
+        touch_number: int,
+    ) -> OutreachDraft | None:
+        row = self.db.conn().execute(
+            """
+            SELECT * FROM outreach_drafts
+            WHERE lead_id = ?
+              AND campaign_filename = ?
+              AND touch_number = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (lead_id, campaign_filename, touch_number),
+        ).fetchone()
+        return self._row_to_draft(row) if row else None
+
+    def touch1_subject(self, lead_id: str, campaign_filename: str) -> str:
+        row = self.db.conn().execute(
+            """
+            SELECT subject
+            FROM outreach_drafts
+            WHERE lead_id = ?
+              AND campaign_filename = ?
+              AND touch_number = 1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (lead_id, campaign_filename),
+        ).fetchone()
+        return (row["subject"] if row else "") or ""
+
+    def previous_sent_draft(
+        self,
+        lead_id: str,
+        campaign_filename: str,
+        touch_number: int,
+    ) -> OutreachDraft | None:
+        row = self.db.conn().execute(
+            """
+            SELECT * FROM outreach_drafts
+            WHERE lead_id = ?
+              AND campaign_filename = ?
+              AND touch_number < ?
+              AND status = 'sent'
+            ORDER BY touch_number DESC, sent_at DESC
+            LIMIT 1
+            """,
+            (lead_id, campaign_filename, touch_number),
+        ).fetchone()
+        return self._row_to_draft(row) if row else None
+
+    def sent_draft_exists(
+        self,
+        lead_id: str,
+        campaign_filename: str,
+        touch_number: int,
+    ) -> bool:
+        row = self.db.conn().execute(
+            """
+            SELECT 1 FROM outreach_drafts
+            WHERE lead_id = ?
+              AND campaign_filename = ?
+              AND touch_number = ?
+              AND status = 'sent'
+            LIMIT 1
+            """,
+            (lead_id, campaign_filename, touch_number),
+        ).fetchone()
+        return bool(row)
+
+    def campaigns_with_state_for_lead(self, lead_id: str) -> list[str]:
+        rows = self.db.conn().execute(
+            """
+            SELECT DISTINCT campaign_filename
+            FROM lead_sequence_state
+            WHERE lead_id = ?
+            ORDER BY campaign_filename ASC
+            """,
+            (lead_id,),
+        ).fetchall()
+        return [row["campaign_filename"] or "" for row in rows]
+
+    def _active_touch_numbers(self, campaign_filename: str) -> list[int]:
+        rows = self.db.conn().execute(
+            """
+            SELECT touch_number
+            FROM campaign_sequence_steps
+            WHERE campaign_filename = ?
+              AND is_active = 1
+            ORDER BY touch_number ASC
+            """,
+            (campaign_filename,),
+        ).fetchall()
+        return [int(row["touch_number"] or 0) for row in rows]
+
+    def _next_active_touch(
+        self,
+        campaign_filename: str,
+        current_touch: int,
+    ) -> int | None:
+        for number in self._active_touch_numbers(campaign_filename):
+            if number > current_touch:
+                return number
+        return None
+
+    def _campaign_lead_rows_for_due(self, campaign_filename: str) -> list[dict]:
+        rows: list[dict] = []
+        for run_id in _campaign_run_ids(self.db.conn(), campaign_filename):
+            run_rows = self.db.conn().execute(
+                """
+                SELECT *
+                FROM leads
+                WHERE run_id = ?
+                ORDER BY created_at ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            rows.extend(dict(row) for row in run_rows)
+        return rows
+
+    def due_items(
+        self,
+        campaign_filename: str,
+        lead_ids: list[str] | set[str] | None = None,
+        touch_number: int | None = None,
+    ) -> list[dict]:
+        if not self._active_touch_numbers(campaign_filename):
+            return []
+
+        allowed_ids = set(lead_ids or [])
+        now = datetime.utcnow()
+        due = []
+
+        for lead in self._campaign_lead_rows_for_due(campaign_filename):
+            lead_id = lead["id"] or ""
+            if allowed_ids and lead_id not in allowed_ids:
+                continue
+            if not (lead["email"] or ""):
+                continue
+
+            state = self.get_or_create_state(lead_id, campaign_filename)
+            if state.status in STOPPED_SEQUENCE_STATUSES:
+                continue
+
+            due_touch = None
+            if (
+                state.current_touch > 0
+                and state.next_touch_due_at
+                and state.next_touch_due_at <= now
+            ):
+                if not self.sent_draft_exists(
+                    lead_id,
+                    campaign_filename,
+                    state.current_touch,
+                ):
+                    continue
+                next_touch = self._next_active_touch(
+                    campaign_filename,
+                    state.current_touch,
+                )
+                if next_touch and not self.sent_draft_exists(
+                    lead_id,
+                    campaign_filename,
+                    next_touch,
+                ):
+                    due_touch = next_touch
+
+            if touch_number and due_touch != touch_number:
+                continue
+            if not due_touch:
+                continue
+
+            draft = self.latest_draft_for_touch(
+                lead_id,
+                campaign_filename,
+                due_touch,
+            )
+            draft_id = ""
+            draft_status = ""
+            if draft and draft.status in {"draft", "approved"}:
+                draft_id = draft.id
+                draft_status = draft.status
+
+            if state.status == "waiting_followup":
+                state.status = "followup_due"
+                self.upsert_state(state)
+                self.add_activity(LeadActivity(
+                    lead_id=lead_id,
+                    campaign_filename=campaign_filename,
+                    run_id=lead["run_id"] or "",
+                    activity_type="followup_due",
+                    title=f"Touch {due_touch} is due",
+                    description="",
+                    metadata_json=json.dumps({"touch_number": due_touch}),
+                ))
+
+            due.append({
+                "lead_id": lead_id,
+                "full_name": lead["full_name"] or "",
+                "company": lead["company"] or "",
+                "title": lead["title"] or "",
+                "email": lead["email"] or "",
+                "touch_number": due_touch,
+                "draft_id": draft_id,
+                "draft_status": draft_status,
+                "next_touch_due_at": _dt_to_text(state.next_touch_due_at),
+                "status": state.status,
+                "due_label": "Due now",
+            })
+        return due
 
     def _row_to_draft(self, row: sqlite3.Row) -> OutreachDraft:
         return OutreachDraft(
@@ -1332,6 +1730,7 @@ class LeadRepository:
                 lead.email,
                 lead.email_confidence,
                 lead.phone,
+                getattr(lead, "duplicate_of_lead_id", "") or "",
                 lead.intent_score,
                 lead.segment.value,
                 lead.status.value,
@@ -1340,20 +1739,21 @@ class LeadRepository:
             )
             for lead in leads
         ]
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO leads (
                     id, run_id, full_name, first_name, last_name,
                     title, company, company_domain, location, linkedin_url,
                     company_linkedin_url, email, email_confidence, phone,
+                    duplicate_of_lead_id,
                     intent_score, segment, status, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
-            sample = self.db._conn().execute(
+            sample = self.db.conn().execute(
                 "SELECT full_name, phone FROM leads ORDER BY rowid DESC LIMIT 3"
             ).fetchall()
             import logging
@@ -1361,24 +1761,369 @@ class LeadRepository:
             logging.getLogger(__name__).info(f"DB phone check: {sample}")
 
     def get_by_run(self, run_id: str) -> list[Lead]:
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             "SELECT * FROM leads WHERE run_id = ? ORDER BY created_at ASC",
             (run_id,),
         ).fetchall()
         return [self._row_to_lead(row) for row in rows]
 
     def get_by_id(self, lead_id: str) -> Optional[Lead]:
-        row = self.db._conn().execute(
+        row = self.db.conn().execute(
             "SELECT * FROM leads WHERE id = ?",
             (lead_id,),
         ).fetchone()
         return self._row_to_lead(row) if row else None
 
+    def get_by_email(self, email: str) -> list[Lead]:
+        normalized = (email or "").strip().lower()
+        if not normalized:
+            return []
+        rows = self.db.conn().execute(
+            """
+            SELECT *
+            FROM leads
+            WHERE LOWER(COALESCE(email, '')) = ?
+            ORDER BY created_at ASC
+            """,
+            (normalized,),
+        ).fetchall()
+        return [self._row_to_lead(row) for row in rows]
+
+    def _normalize_linkedin_url(self, value: str) -> str:
+        return (value or "").strip().split("?", 1)[0].rstrip("/").lower()
+
+    def find_global_duplicate(
+        self,
+        linkedin_url: str,
+        email: str,
+        exclude_id: str = "",
+    ) -> dict | None:
+        exclude_id = (exclude_id or "").strip()
+        normalized_url = self._normalize_linkedin_url(linkedin_url)
+        if normalized_url:
+            rows = self.db.conn().execute(
+                """
+                SELECT id, run_id, linkedin_url
+                FROM leads
+                WHERE id != ?
+                  AND COALESCE(linkedin_url, '') != ''
+                ORDER BY created_at ASC
+                """,
+                (exclude_id,),
+            ).fetchall()
+            for row in rows:
+                if self._normalize_linkedin_url(row["linkedin_url"]) == normalized_url:
+                    return {
+                        "id": row["id"] or "",
+                        "run_id": row["run_id"] or "",
+                    }
+
+        normalized_email = (email or "").strip().lower()
+        if normalized_email:
+            row = self.db.conn().execute(
+                """
+                SELECT id, run_id
+                FROM leads
+                WHERE id != ?
+                  AND LOWER(COALESCE(email, '')) = ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (exclude_id, normalized_email),
+            ).fetchone()
+            if row:
+                return {
+                    "id": row["id"] or "",
+                    "run_id": row["run_id"] or "",
+                }
+
+        return None
+
+    def set_duplicate_of(
+        self,
+        lead_id: str,
+        duplicate_of_lead_id: str,
+    ) -> None:
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE leads
+                SET duplicate_of_lead_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    duplicate_of_lead_id or "",
+                    _dt_to_text(datetime.utcnow()),
+                    lead_id,
+                ),
+            )
+
+    def mark_duplicate_if_any(
+        self,
+        lead_id: str,
+        campaign_filename: str = "",
+    ) -> dict | None:
+        lead = self.get_by_id(lead_id)
+        if not lead:
+            return None
+
+        hit = self.find_global_duplicate(
+            lead.linkedin_url,
+            lead.email,
+            lead.id,
+        )
+        if not hit or not hit.get("id"):
+            return None
+
+        existing_duplicate = getattr(lead, "duplicate_of_lead_id", "") or ""
+        if existing_duplicate == hit["id"]:
+            return hit
+
+        self.set_duplicate_of(lead.id, hit["id"])
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO lead_activities (
+                    id, lead_id, campaign_filename, run_id, activity_type,
+                    title, description, metadata_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid4().hex,
+                    lead.id,
+                    campaign_filename or "",
+                    getattr(lead, "run_id", "") or "",
+                    "duplicate_detected",
+                    "Also exists in another campaign",
+                    "",
+                    json.dumps({
+                        "duplicate_of_lead_id": hit["id"],
+                        "duplicate_run_id": hit.get("run_id", ""),
+                    }),
+                    _dt_to_text(datetime.utcnow()),
+                ),
+            )
+        return hit
+
+    def get_by_campaign(
+        self,
+        campaign_filename: str,
+        exclude_run_id: str = "",
+    ) -> list[Lead]:
+        leads: list[Lead] = []
+        for run_id in _campaign_run_ids(self.db.conn(), campaign_filename):
+            if exclude_run_id and run_id == exclude_run_id:
+                continue
+            leads.extend(self.get_by_run(run_id))
+        return leads
+
+    def search(
+        self,
+        campaign_filename: str = "",
+        q: str = "",
+        segment: str | None = None,
+        limit: int | None = 500,
+        offset: int = 0,
+        run_id: str = "",
+        drafts_only: bool = False,
+        newest_first: bool = False,
+    ) -> tuple[list[Lead], int]:
+        where: list[str] = []
+        params: list = []
+
+        if campaign_filename:
+            run_ids = (
+                [run_id]
+                if run_id
+                else _campaign_run_ids(self.db.conn(), campaign_filename)
+            )
+            if not run_ids:
+                return [], 0
+            placeholders = ",".join("?" for _ in run_ids)
+            where.append(f"run_id IN ({placeholders})")
+            params.extend(run_ids)
+        elif run_id:
+            where.append("run_id = ?")
+            params.append(run_id)
+
+        if segment and segment.lower() not in {"all", ""}:
+            where.append("segment = ?")
+            params.append(segment.upper().replace("-", "_"))
+
+        if q:
+            like = f"%{q.strip()}%"
+            where.append(
+                """
+                (
+                    full_name LIKE ?
+                    OR company LIKE ?
+                    OR title LIKE ?
+                    OR email LIKE ?
+                )
+                """
+            )
+            params.extend([like, like, like, like])
+
+        if drafts_only:
+            where.append(
+                "(COALESCE(email_subject, '') != '' OR COALESCE(email_body, '') != '')"
+            )
+
+        where_sql = " AND ".join(where) if where else "1=1"
+        count_row = self.db.conn().execute(
+            f"SELECT COUNT(*) AS total FROM leads WHERE {where_sql}",
+            params,
+        ).fetchone()
+        total = int(count_row["total"] or 0) if count_row else 0
+
+        order = "DESC" if newest_first else "ASC"
+        limit_sql = ""
+        query_params = list(params)
+        if limit is not None:
+            limit_sql = " LIMIT ? OFFSET ?"
+            query_params.extend([limit, offset])
+
+        rows = self.db.conn().execute(
+            f"""
+            SELECT *
+            FROM leads
+            WHERE {where_sql}
+            ORDER BY created_at {order}
+            {limit_sql}
+            """,
+            query_params,
+        ).fetchall()
+        return [self._row_to_lead(row) for row in rows], total
+
+    def find_sendable(
+        self,
+        run_id: str,
+        lead_ids: set | None = None,
+    ) -> list[Lead]:
+        where = [
+            "run_id = ?",
+            "email != ''",
+            "email_subject != ''",
+            "email_body != ''",
+            """
+            COALESCE(email_sequence_status, '') NOT IN
+            ('replied', 'unsubscribed', 'complete', 'completed')
+            """,
+        ]
+        params: list = [run_id]
+        if lead_ids:
+            placeholders = ",".join("?" for _ in lead_ids)
+            where.append(f"id IN ({placeholders})")
+            params.extend(list(lead_ids))
+        rows = self.db.conn().execute(
+            f"""
+            SELECT *
+            FROM leads
+            WHERE {" AND ".join(where)}
+            ORDER BY created_at ASC
+            """,
+            params,
+        ).fetchall()
+        return [self._row_to_lead(row) for row in rows]
+
+    def update_sequence_status(
+        self,
+        lead_id: str,
+        status: str,
+        error: str = "",
+    ) -> None:
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE leads
+                SET email_sequence_status = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (status, _dt_to_text(datetime.utcnow()), lead_id),
+            )
+
+    def update_segments(self, run_id: str, leads: list[Lead]) -> None:
+        if not leads:
+            return
+        with self.db.conn() as conn:
+            conn.executemany(
+                """
+                UPDATE leads
+                SET segment = ?, status = ?, updated_at = ?
+                WHERE id = ? AND run_id = ?
+                """,
+                [
+                    (
+                        lead.segment.value,
+                        lead.status.value,
+                        _dt_to_text(datetime.utcnow()),
+                        lead.id,
+                        run_id,
+                    )
+                    for lead in leads
+                ],
+            )
+
+    def save_personalised_message(
+        self,
+        lead_id: str,
+        email_subject: str,
+        email_body: str,
+        linkedin_message: str,
+        research_summary: str,
+        campaign_name: str,
+    ) -> None:
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE leads SET
+                    email_subject = ?,
+                    email_body = ?,
+                    linkedin_message = ?,
+                    research_summary = ?,
+                    personalised_at = ?,
+                    campaign_name = ?
+                WHERE id = ?
+                """,
+                (
+                    email_subject,
+                    email_body,
+                    linkedin_message,
+                    research_summary,
+                    _dt_to_text(datetime.utcnow()),
+                    campaign_name,
+                    lead_id,
+                ),
+            )
+
+    def count_all(self) -> int:
+        row = self.db.conn().execute(
+            "SELECT COUNT(*) AS total FROM leads"
+        ).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def count_sequence_statuses(self, statuses: set[str]) -> int:
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" for _ in statuses)
+        row = self.db.conn().execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM leads
+            WHERE email_sequence_status IN ({placeholders})
+            """,
+            list(statuses),
+        ).fetchone()
+        return int(row["total"] or 0) if row else 0
+
     def delete_for_run(self, run_id: str, lead_ids: list[str]) -> int:
         if not lead_ids:
             return 0
         placeholders = ",".join("?" for _ in lead_ids)
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             cur = conn.execute(
                 f"""
                 DELETE FROM leads
@@ -1398,7 +2143,7 @@ class LeadRepository:
         if not lead_ids:
             return
         placeholders = ",".join("?" for _ in lead_ids)
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 f"""
                 UPDATE leads
@@ -1443,7 +2188,7 @@ class LeadRepository:
         ):
             return False
 
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 UPDATE leads
@@ -1496,17 +2241,8 @@ class LeadRepository:
             )
         return True
 
-    def count_by_segment(self, run_id: str) -> dict:
+    def _segment_count_payload(self, rows: list[sqlite3.Row]) -> dict:
         counts = {"warm": 0, "cold": 0, "no_email": 0}
-        rows = self.db._conn().execute(
-            """
-            SELECT segment, COUNT(*) AS total
-            FROM leads
-            WHERE run_id = ?
-            GROUP BY segment
-            """,
-            (run_id,),
-        ).fetchall()
         for row in rows:
             if row["segment"] == Segment.WARM.value:
                 counts["warm"] = row["total"]
@@ -1515,6 +2251,34 @@ class LeadRepository:
             elif row["segment"] == Segment.NO_EMAIL.value:
                 counts["no_email"] = row["total"]
         return counts
+
+    def count_by_segment(self, campaign_filename: str) -> dict:
+        run_ids = _campaign_run_ids(self.db.conn(), campaign_filename)
+        if not run_ids:
+            return {"warm": 0, "cold": 0, "no_email": 0}
+        placeholders = ",".join("?" for _ in run_ids)
+        rows = self.db.conn().execute(
+            f"""
+            SELECT segment, COUNT(*) AS total
+            FROM leads
+            WHERE run_id IN ({placeholders})
+            GROUP BY segment
+            """,
+            run_ids,
+        ).fetchall()
+        return self._segment_count_payload(rows)
+
+    def count_by_segment_for_run(self, run_id: str) -> dict:
+        rows = self.db.conn().execute(
+            """
+            SELECT segment, COUNT(*) AS total
+            FROM leads
+            WHERE run_id = ?
+            GROUP BY segment
+            """,
+            (run_id,),
+        ).fetchall()
+        return self._segment_count_payload(rows)
 
     def update_from_enrichment(
         self,
@@ -1688,10 +2452,7 @@ class LeadRepository:
             "campaign_name": "",
             "personalised_at": None,
             "email_sequence_status": "not_started",
-            "day1_sent_at": None,
-            "day3_sent_at": None,
-            "day7_sent_at": None,
-            "email_sequence_error": "",
+            "duplicate_of_lead_id": "",
         }
         row_keys = set(row.keys())
         for field, default in optional_fields.items():
@@ -1699,13 +2460,567 @@ class LeadRepository:
                 setattr(lead, field, row[field] or default)
         return lead
 
+class JobRepo:
+    TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def _json_loads(self, value: str | None) -> dict:
+        if not value:
+            return {}
+        try:
+            data = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _row_to_job(self, row: sqlite3.Row | None) -> dict | None:
+        if not row:
+            return None
+        data = dict(row)
+        data["payload"] = self._json_loads(data.pop("payload_json", "{}"))
+        data["result"] = self._json_loads(data.pop("result_json", "{}"))
+        data["cancel_requested"] = bool(data.get("cancel_requested"))
+        return data
+
+    def create(self, type: str, payload: dict, total: int = 0) -> dict:
+        now = _dt_to_text(datetime.utcnow())
+        job_id = str(uuid4())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO jobs (
+                    id, type, status, total, done, failed, skipped,
+                    payload_json, result_json, error, cancel_requested,
+                    created_at, started_at, finished_at, updated_at
+                )
+                VALUES (?, ?, 'queued', ?, 0, 0, 0, ?, '{}', '', 0, ?, '', '', ?)
+                """,
+                (
+                    job_id,
+                    type,
+                    int(total or 0),
+                    json.dumps(payload or {}, default=str),
+                    now,
+                    now,
+                ),
+            )
+        return self.get(job_id) or {
+            "id": job_id,
+            "type": type,
+            "status": "queued",
+            "total": int(total or 0),
+            "done": 0,
+            "failed": 0,
+            "skipped": 0,
+            "payload": payload or {},
+            "result": {},
+            "error": "",
+            "cancel_requested": False,
+            "created_at": now,
+            "started_at": "",
+            "finished_at": "",
+            "updated_at": now,
+        }
+
+    def get(self, job_id: str) -> dict | None:
+        row = self.db.conn().execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE id = ?
+            """,
+            ((job_id or "").strip(),),
+        ).fetchone()
+        return self._row_to_job(row)
+
+    def list_recent(self, limit: int = 20) -> list[dict]:
+        rows = self.db.conn().execute(
+            """
+            SELECT *
+            FROM jobs
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 20), 200)),),
+        ).fetchall()
+        return [job for row in rows if (job := self._row_to_job(row))]
+
+    def mark_running(self, job_id: str) -> None:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'running',
+                    started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                    updated_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (now, now, job_id),
+            )
+
+    def update_progress(
+        self,
+        job_id: str,
+        done_delta: int = 0,
+        failed_delta: int = 0,
+        skipped_delta: int = 0,
+        result_item: dict | None = None,
+    ) -> None:
+        job = self.get(job_id)
+        if not job:
+            return
+
+        result = dict(job.get("result") or {})
+        if result_item is not None:
+            items = list(result.get("items") or [])
+            items.append(result_item)
+            result["items"] = items
+            status = (result_item.get("status") or "").strip().lower()
+            if status:
+                result[status] = int(result.get(status) or 0) + 1
+            if result_item.get("message") and not result.get("message"):
+                result["message"] = result_item.get("message")
+            if result_item.get("reason") and not result.get("first_reason"):
+                result["first_reason"] = result_item.get("reason")
+
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET done = done + ?,
+                    failed = failed + ?,
+                    skipped = skipped + ?,
+                    result_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    int(done_delta or 0),
+                    int(failed_delta or 0),
+                    int(skipped_delta or 0),
+                    json.dumps(result, default=str),
+                    now,
+                    job_id,
+                ),
+            )
+
+    def mark_done(self, job_id: str) -> None:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'done',
+                    finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END,
+                    updated_at = ?
+                WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')
+                """,
+                (now, now, job_id),
+            )
+
+    def mark_cancelled(self, job_id: str) -> None:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'cancelled',
+                    finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END,
+                    updated_at = ?
+                WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')
+                """,
+                (now, now, job_id),
+            )
+
+    def mark_failed(self, job_id: str, error: str) -> None:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    error = ?,
+                    finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END,
+                    updated_at = ?
+                WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')
+                """,
+                ((error or "")[:2000], now, now, job_id),
+            )
+
+    def delete_many(self, job_ids: list[str]) -> int:
+        if not job_ids:
+            return 0
+        placeholders = ",".join("?" for _ in job_ids)
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                f"DELETE FROM jobs WHERE id IN ({placeholders})",
+                job_ids,
+            )
+            return cur.rowcount
+
+    def request_cancel(self, job_id: str) -> None:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET cancel_requested = 1,
+                    updated_at = ?
+                WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')
+                """,
+                (now, job_id),
+            )
+
+    def next_queued(self) -> dict | None:
+        row = self.db.conn().execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE status = 'queued'
+            ORDER BY created_at ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        return self._row_to_job(row)
+
+    def reset_stale_running_to_failed_on_startup(self) -> None:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed',
+                    error = 'Job was running when the API stopped',
+                    finished_at = CASE WHEN finished_at = '' THEN ? ELSE finished_at END,
+                    updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now, now),
+            )
+
+
+class SendLogRepo:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def _normalize_email(self, email: str) -> str:
+        return (email or "").strip().lower()
+
+    def _domain_for_email(self, email: str) -> str:
+        normalized = self._normalize_email(email)
+        if "@" not in normalized:
+            return ""
+        return normalized.rsplit("@", 1)[-1].strip().lower()
+
+    def _karachi_today_bounds_utc(self) -> tuple[str, str]:
+        """
+        Return today's Asia/Karachi day boundaries as UTC ISO strings.
+
+        The DB stores sent_at using datetime.utcnow().isoformat().
+        Karachi is UTC+05:00, so local midnight = previous UTC day 19:00.
+        """
+        now_karachi = datetime.utcnow() + timedelta(hours=5)
+        start_karachi = now_karachi.replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        end_karachi = start_karachi + timedelta(days=1)
+
+        start_utc = start_karachi - timedelta(hours=5)
+        end_utc = end_karachi - timedelta(hours=5)
+
+        return _dt_to_text(start_utc), _dt_to_text(end_utc)
+
+    def record(
+        self,
+        lead_id: str,
+        campaign_filename: str,
+        to_email: str,
+        touch_number: int,
+    ) -> None:
+        normalized_email = self._normalize_email(to_email)
+        to_domain = self._domain_for_email(normalized_email)
+
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO send_log (
+                    lead_id, campaign_filename, to_email, to_domain,
+                    touch_number, sent_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lead_id or "",
+                    campaign_filename or "",
+                    normalized_email,
+                    to_domain,
+                    int(touch_number or 0),
+                    _dt_to_text(datetime.utcnow()),
+                ),
+            )
+
+    def delete_for_lead(self, lead_id: str) -> int:
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM send_log
+                WHERE lead_id = ?
+                """,
+                (lead_id,),
+            )
+            return cur.rowcount
+
+    def delete_for_lead_prefix(self, lead_id_prefix: str) -> int:
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM send_log
+                WHERE lead_id LIKE ?
+                """,
+                (f"{lead_id_prefix}%",),
+            )
+            return cur.rowcount
+
+    def count_today(self) -> int:
+        start_utc, end_utc = self._karachi_today_bounds_utc()
+        row = self.db.conn().execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM send_log
+            WHERE sent_at >= ? AND sent_at < ?
+            """,
+            (start_utc, end_utc),
+        ).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def count_today_for_domain(self, domain: str) -> int:
+        normalized_domain = (domain or "").strip().lower()
+        if not normalized_domain:
+            return 0
+
+        start_utc, end_utc = self._karachi_today_bounds_utc()
+        row = self.db.conn().execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM send_log
+            WHERE to_domain = ?
+              AND sent_at >= ?
+              AND sent_at < ?
+            """,
+            (normalized_domain, start_utc, end_utc),
+        ).fetchone()
+        return int(row["total"] or 0) if row else 0
+
+    def last_send_for_email(self, email: str) -> dict | None:
+        normalized_email = self._normalize_email(email)
+        if not normalized_email:
+            return None
+
+        row = self.db.conn().execute(
+            """
+            SELECT campaign_filename, sent_at
+            FROM send_log
+            WHERE to_email = ?
+            ORDER BY sent_at DESC
+            LIMIT 1
+            """,
+            (normalized_email,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "campaign_filename": row["campaign_filename"] or "",
+            "sent_at": row["sent_at"] or "",
+        }
+
+    def first_send_date(self) -> date | None:
+        row = self.db.conn().execute(
+            """
+            SELECT MIN(sent_at) AS first_sent_at
+            FROM send_log
+            WHERE sent_at IS NOT NULL AND sent_at != ''
+            """
+        ).fetchone()
+
+        if not row or not row["first_sent_at"]:
+            return None
+
+        try:
+            return datetime.fromisoformat(row["first_sent_at"]).date()
+        except ValueError:
+            return None
+
+class KvRepo:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def get(self, key: str) -> str:
+        normalized_key = (key or "").strip()
+        if not normalized_key:
+            return ""
+
+        row = self.db.conn().execute(
+            """
+            SELECT value
+            FROM kv_store
+            WHERE key = ?
+            """,
+            (normalized_key,),
+        ).fetchone()
+
+        if not row:
+            return ""
+        return row["value"] or ""
+
+    def set(self, key: str, value: str) -> None:
+        normalized_key = (key or "").strip()
+        if not normalized_key:
+            return
+
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO kv_store (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_key,
+                    value or "",
+                    _dt_to_text(datetime.utcnow()),
+                ),
+            )
+
+    def delete(self, key: str) -> bool:
+        normalized_key = (key or "").strip()
+        if not normalized_key:
+            return False
+
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM kv_store
+                WHERE key = ?
+                """,
+                (normalized_key,),
+            )
+            return cur.rowcount > 0
+
+
+class SuppressionRepo:
+    VALID_REASONS = {"unsubscribed", "bounced", "manual", "complained"}
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def _normalize_email(self, email: str) -> str:
+        return (email or "").strip().lower()
+
+    def _normalize_reason(self, reason: str) -> str:
+        reason = (reason or "").strip().lower()
+        if reason not in self.VALID_REASONS:
+            reason = "manual"
+        return reason
+
+    def add(
+        self,
+        email: str,
+        reason: str,
+        source_lead_id: str = "",
+        source_campaign: str = "",
+    ) -> None:
+        normalized = self._normalize_email(email)
+        if not normalized:
+            return
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO suppression (
+                    email, reason, source_lead_id, source_campaign, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized,
+                    self._normalize_reason(reason),
+                    source_lead_id or "",
+                    source_campaign or "",
+                    _dt_to_text(datetime.utcnow()),
+                ),
+            )
+
+    def is_suppressed(self, email: str) -> bool:
+        normalized = self._normalize_email(email)
+        if not normalized:
+            return False
+        row = self.db.conn().execute(
+            "SELECT 1 FROM suppression WHERE email = ?",
+            (normalized,),
+        ).fetchone()
+        return row is not None
+
+    def bulk_check(self, emails: list[str]) -> set[str]:
+        normalized = sorted({
+            self._normalize_email(email)
+            for email in emails
+            if self._normalize_email(email)
+        })
+        suppressed: set[str] = set()
+        for i in range(0, len(normalized), 500):
+            chunk = normalized[i:i + 500]
+            if not chunk:
+                continue
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.conn().execute(
+                f"""
+                SELECT email
+                FROM suppression
+                WHERE email IN ({placeholders})
+                """,
+                chunk,
+            ).fetchall()
+            suppressed.update(row["email"] for row in rows)
+        return suppressed
+
+    def list_all(self, limit: int = 500) -> list[dict]:
+        rows = self.db.conn().execute(
+            """
+            SELECT email, reason, source_lead_id, source_campaign, created_at
+            FROM suppression
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def remove(self, email: str) -> bool:
+        normalized = self._normalize_email(email)
+        if not normalized:
+            return False
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM suppression WHERE email = ?",
+                (normalized,),
+            )
+            return cur.rowcount > 0
+
 
 class EventRepository:
     def __init__(self, db: Database):
         self.db = db
 
     def save(self, event: AgentEvent) -> None:
-        with self.db._conn() as conn:
+        with self.db.conn() as conn:
             conn.execute(
                 """
                 INSERT INTO agent_events (
@@ -1724,7 +3039,7 @@ class EventRepository:
             )
 
     def get_by_run(self, run_id: str, limit: int = 100) -> list[dict]:
-        rows = self.db._conn().execute(
+        rows = self.db.conn().execute(
             """
             SELECT run_id, event_type, agent_name, payload, error, timestamp
             FROM agent_events
@@ -1752,5 +3067,10 @@ run_repo = RunRepository(db)
 lead_repo = LeadRepository(db)
 event_repo = EventRepository(db)
 lead_universe_repo = LeadUniverseRepository(db)
+campaign_repo = CampaignRepo(db)
 campaign_sequence_repo = CampaignSequenceRepository(db)
 outreach_repo = OutreachRepository(db)
+job_repo = JobRepo(db)
+send_log_repo = SendLogRepo(db)
+kv_repo = KvRepo(db)
+suppression_repo = SuppressionRepo(db)

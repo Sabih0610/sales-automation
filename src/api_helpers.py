@@ -1,0 +1,2121 @@
+##src\api.py
+import secrets
+import asyncio
+import csv, io
+import html
+import json
+import json as _json
+import logging
+import os
+import shutil
+import threading
+from datetime import datetime, time, timedelta
+from pathlib import Path
+from typing import Optional
+
+from fastapi import (
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi import UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel
+
+from src import orchestrator as orchestrator_module
+from src.agents.reply_monitor import (
+    get_inbox_monitor_status,
+    run_reply_monitor_loop,
+)
+
+from src.campaign_config import CampaignConfigModel
+from src.send_policy import SendPolicy, next_send_delay_seconds
+from src.job_worker import get_job_worker
+
+
+from src.agents.export_agent import ExportAgent
+from src.agents.scraper_agent import ScraperAgent
+from src.agents.segment_agent import SegmentAgent
+from src.config import settings
+from src.models import (
+    AgentEvent,
+    CampaignSequenceRules,
+    CampaignSequenceStep,
+    EventType,
+    Lead,
+    LeadActivity,
+    LeadSequenceState,
+    LeadSourceSegment,
+    LeadUniverse,
+    OutreachDraft,
+    PipelineRun,
+    RunStatus,
+)
+from src.personalisation.knowledge_base import KnowledgeBaseLoader
+from src.graph_client import send_via_graph
+from src.storage import (
+    campaign_repo,
+    campaign_sequence_repo,
+    event_repo,
+    job_repo,
+    lead_repo,
+    lead_universe_repo,
+    outreach_repo,
+    run_repo,
+    send_log_repo,
+    suppression_repo,
+)
+
+from src.sequence import calculate_next_touch_due_at
+from src.sequence_modes import normalize_sequence_mode
+from src.unsubscribe import make_unsubscribe_url, parse_token
+
+
+logger = logging.getLogger(__name__)
+COMPANY_FOOTER_ADDRESS = (
+    "Royal Cyber Inc., 55 Shuman Blvd, Suite 275, Naperville, IL 60563"
+)
+
+orchestrator = orchestrator_module.PipelineOrchestrator()
+_segment_runner_lock = threading.Lock()
+_running_segment_ids: set[str] = set()
+
+
+def _apply_unsubscribe_token(token: str) -> dict | None:
+    payload = parse_token(token)
+    if not payload:
+        return None
+    email = payload["email"]
+    lead_id = payload.get("lead_id", "")
+    suppression_repo.add(email, "unsubscribed", lead_id)
+    if lead_id and lead_repo.get_by_id(lead_id):
+        for state in outreach_repo.list_states_for_lead(lead_id):
+            _stop_sequence(
+                lead_id,
+                state.campaign_filename,
+                "unsubscribed",
+                "unsubscribed",
+            )
+    return payload
+
+
+class StartPipelineRequest(BaseModel):
+    titles: list[str] = ["CTO", "CIO", "CXO", "Head of Data", "VP Engineering"]
+    industries: list[str] = []
+    geos: list[str] = []
+    company_sizes: list[str] = []
+    keywords: str = "Microsoft Fabric"
+    start_url: str = ""
+    max_leads: int = 1000
+    campaign: str = ""
+
+
+class RunResponse(BaseModel):
+    id: str
+    label: str = ""
+    status: str
+    filters: dict
+    total_scraped: int
+    total_enriched: int
+    total_warm: int
+    total_cold: int
+    total_no_email: int
+    total_exported: int
+    error: str
+    started_at: str
+    completed_at: Optional[str]
+
+
+class LeadResponse(BaseModel):
+    id: str
+    full_name: str
+    first_name: str
+    last_name: str
+    title: str
+    company: str
+    company_domain: str
+    email: str
+    email_confidence: str
+    phone: str
+    location: str
+    linkedin_url: str
+    company_linkedin_url: str
+    segment: str
+    intent_score: float
+    status: str
+    email_sequence_status: str = "not_started"
+    duplicate_of_lead_id: str = ""
+
+
+class SequenceTouchRequest(BaseModel):
+    number: int
+    name: str
+    delay_days: int = 0
+    delay_value: int = 0
+    delay_unit: str = "days"
+    delay_type: str = "calendar_days"
+    send_time_mode: str = "same_as_previous"
+    fixed_send_time: str = ""
+    subject_template: str = ""
+    email_body_template: str = ""
+    linkedin_message_template: str = ""
+    is_active: bool = True
+
+
+class SequenceRulesRequest(BaseModel):
+    timezone: str = "Asia/Karachi"
+    mode: str = "manual"
+    stop_on_reply: bool = True
+    stop_on_bounce: bool = True
+    stop_on_unsubscribe: bool = True
+    skip_no_email: bool = True
+    skip_weekends: bool = True
+    send_window_start: str = "09:00"
+    send_window_end: str = "17:00"
+    daily_send_limit: int = 50
+    delay_between_sends_seconds: int = 60
+    require_approval_for_touch1: bool = True
+    require_approval_for_followups: bool = True
+
+
+class SequenceSettingsRequest(BaseModel):
+    touches: list[SequenceTouchRequest] = []
+    steps: list[SequenceTouchRequest] = []
+    rules: SequenceRulesRequest | None = None
+
+
+class GenerateDraftsRequest(BaseModel):
+    lead_ids: list[str] = []
+    touch_number: int = 1
+    overwrite: bool = False
+
+
+class OutreachDraftUpdateRequest(BaseModel):
+    subject: str | None = None
+    body: str | None = None
+    linkedin_message: str | None = None
+    status: str | None = None
+
+
+class ApproveSelectedDraftsRequest(BaseModel):
+    draft_ids: list[str] = []
+
+
+class SkipDraftRequest(BaseModel):
+    reason: str = ""
+
+
+class SendSelectedDraftsRequest(BaseModel):
+    draft_ids: list[str] = []
+
+
+class DraftSendTestRequest(BaseModel):
+    test_email: str = ""
+
+
+class QueueGenerateDueRequest(BaseModel):
+    lead_ids: list[str] = []
+    touch_number: int | None = None
+
+
+class ManualLeadStatusRequest(BaseModel):
+    campaign_filename: str
+    reason: str = ""
+
+
+class SendEmailRequest(BaseModel):
+    run_id: str
+    day: int = 0
+
+
+class SettingsRequest(BaseModel):
+    sender_email: str = ""
+    openai_model: str = "gpt-4o-mini"
+    zoominfo_enabled: bool = False
+    max_emails_per_day: int = 150
+    send_delay_seconds: int = 3
+
+
+class SuppressionRequest(BaseModel):
+    email: str
+    reason: str = "manual"
+    source_lead_id: str = ""
+    source_campaign: str = ""
+
+
+class CreateCampaignRequest(CampaignConfigModel):
+    name: str
+    description: str = ""
+
+
+class CreateLeadUniverseRequest(BaseModel):
+    name: str
+    campaign_filename: str
+    description: str = ""
+    target_leads: int = 0
+    source_type: str = "sales_navigator"
+
+
+class CreateLeadSourceSegmentRequest(BaseModel):
+    source_url: str
+    label: str = ""
+    filters: dict = {}
+    expected_count: int = 50
+
+
+def _dt(value) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _normalize_campaign(value: str) -> str:
+    return (
+        (value or "")
+        .replace(".json", "")
+        .replace("_", " ")
+        .lower()
+        .strip()
+    )
+
+
+def _match_campaign(run_campaign: str, target: str) -> bool:
+    r = _normalize_campaign(run_campaign)
+    t = _normalize_campaign(target)
+    if not r or not t:
+        return False
+    return r == t or r in t or t in r
+
+
+def _step_payload(step: CampaignSequenceStep) -> dict:
+    return {
+        "id": step.id,
+        "campaign_filename": step.campaign_filename,
+        "touch_number": step.touch_number,
+        "number": step.touch_number,
+        "touch_name": step.touch_name,
+        "name": step.touch_name,
+        "delay_days": step.delay_days,
+        "delay_value": step.delay_value if step.delay_value else step.delay_days,
+        "delay_unit": step.delay_unit or "days",
+        "delay_type": step.delay_type or "calendar_days",
+        "send_time_mode": step.send_time_mode or "same_as_previous",
+        "fixed_send_time": step.fixed_send_time or "",
+        "subject_template": step.subject_template,
+        "email_body_template": step.email_body_template,
+        "is_active": step.is_active,
+        "created_at": _dt(step.created_at),
+        "updated_at": _dt(step.updated_at),
+    }
+
+
+def _rules_payload(rules: CampaignSequenceRules) -> dict:
+    return {
+        "id": rules.id,
+        "campaign_filename": rules.campaign_filename,
+        "timezone": rules.timezone,
+        "mode": normalize_sequence_mode(rules.mode),
+        "stop_on_reply": rules.stop_on_reply,
+        "stop_on_bounce": rules.stop_on_bounce,
+        "stop_on_unsubscribe": rules.stop_on_unsubscribe,
+        "skip_no_email": rules.skip_no_email,
+        "skip_weekends": rules.skip_weekends,
+        "send_window_start": rules.send_window_start,
+        "send_window_end": rules.send_window_end,
+        "daily_send_limit": rules.daily_send_limit,
+        "delay_between_sends_seconds": rules.delay_between_sends_seconds,
+        "require_approval_for_touch1": rules.require_approval_for_touch1,
+        "require_approval_for_followups": rules.require_approval_for_followups,
+        "created_at": _dt(rules.created_at),
+        "updated_at": _dt(rules.updated_at),
+    }
+
+
+def _load_sequence_settings(campaign_filename: str) -> dict:
+    steps, rules = campaign_sequence_repo.ensure_defaults(
+        campaign_filename,
+        default_steps=[],
+    )
+    step_rows = [_step_payload(step) for step in steps]
+    return {
+        "steps": step_rows,
+        "touches": step_rows,
+        "rules": _rules_payload(rules),
+    }
+
+
+def _save_sequence_settings(campaign_filename: str, settings: dict) -> None:
+    touches = settings.get("touches") or settings.get("steps") or []
+    for item in touches:
+        touch_number = int(item.get("touch_number") or item.get("number") or 0)
+        if touch_number <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="touch_number must be positive",
+            )
+        delay_days = int(item.get("delay_days") or 0)
+        delay_value = int(item.get("delay_value") or delay_days or 0)
+        delay_unit = (item.get("delay_unit") or "days").lower()
+        delay_type = (item.get("delay_type") or "calendar_days").lower()
+        send_time_mode = (item.get("send_time_mode") or "same_as_previous").lower()
+        if delay_days < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="delay_days must be >= 0",
+            )
+        if delay_value < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="delay_value must be >= 0",
+            )
+        if delay_unit not in {"minutes", "hours", "days"}:
+            raise HTTPException(
+                status_code=400,
+                detail="delay_unit must be minutes, hours, or days",
+            )
+        if delay_type not in {"calendar_days", "business_days"}:
+            raise HTTPException(
+                status_code=400,
+                detail="delay_type must be calendar_days or business_days",
+            )
+        if send_time_mode not in {
+            "same_as_previous",
+            "fixed_time",
+            "next_available_in_window",
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid send_time_mode",
+            )
+        campaign_sequence_repo.save_step(CampaignSequenceStep(
+            campaign_filename=campaign_filename,
+            touch_number=touch_number,
+            touch_name=item.get("touch_name") or item.get("name") or "",
+            delay_days=delay_days,
+            delay_value=delay_value,
+            delay_unit=delay_unit,
+            delay_type=delay_type,
+            send_time_mode=send_time_mode,
+            fixed_send_time=item.get("fixed_send_time", "") or "",
+            subject_template=item.get("subject_template", "") or "",
+            email_body_template=item.get("email_body_template", "") or "",
+            linkedin_message_template="",
+            is_active=bool(item.get("is_active", True)),
+        ))
+
+    touch_numbers = [
+        int(item.get("touch_number") or item.get("number") or 0)
+        for item in touches
+    ]
+    if touch_numbers:
+        campaign_sequence_repo.deactivate_missing_steps(
+            campaign_filename,
+            touch_numbers,
+        )
+
+    rules_data = settings.get("rules") or {}
+    if rules_data:
+        daily_limit = int(rules_data.get("daily_send_limit", 50) or 50)
+        delay_seconds = int(
+            rules_data.get("delay_between_sends_seconds", 60) or 0
+        )
+        if daily_limit <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="daily_send_limit must be > 0",
+            )
+        if delay_seconds < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="delay_between_sends_seconds must be >= 0",
+            )
+        existing = campaign_sequence_repo.get_rules(campaign_filename)
+        mode = normalize_sequence_mode(rules_data.get("mode"))
+        if mode not in {"manual", "auto"}:
+            raise HTTPException(
+                status_code=400,
+                detail="mode must be manual or auto",
+            )
+        rules = CampaignSequenceRules(
+            campaign_filename=campaign_filename,
+            timezone=rules_data.get("timezone", "Asia/Karachi") or "Asia/Karachi",
+            mode=mode,
+            stop_on_reply=bool(rules_data.get("stop_on_reply", True)),
+            stop_on_bounce=bool(rules_data.get("stop_on_bounce", True)),
+            stop_on_unsubscribe=bool(
+                rules_data.get("stop_on_unsubscribe", True)
+            ),
+            skip_no_email=bool(rules_data.get("skip_no_email", True)),
+            skip_weekends=bool(rules_data.get("skip_weekends", True)),
+            send_window_start=rules_data.get("send_window_start", "09:00"),
+            send_window_end=rules_data.get("send_window_end", "17:00"),
+            daily_send_limit=daily_limit,
+            delay_between_sends_seconds=delay_seconds,
+            require_approval_for_touch1=bool(
+                rules_data.get("require_approval_for_touch1", True)
+            ),
+            require_approval_for_followups=bool(
+                rules_data.get("require_approval_for_followups", True)
+            ),
+        )
+        if existing:
+            rules.id = existing.id
+        campaign_sequence_repo.save_rules(rules)
+
+
+def _campaign_run_ids(campaign_filename: str) -> list[str]:
+    return run_repo.ids_for_campaign(campaign_filename)
+
+
+def _run_label(run: PipelineRun) -> str:
+    started = run.started_at
+    started_text = _dt(started) or ""
+    segment = lead_universe_repo.segment_for_run(run.id)
+    if segment and segment.get("label"):
+        return f"{segment['label']} · {started:%b %d, %H:%M}"
+    return f"Run {run.id[:8]} · {started_text}"
+
+
+def _run_response(run: PipelineRun) -> RunResponse:
+    return RunResponse(
+        id=run.id,
+        label=_run_label(run),
+        status=run.status.value,
+        filters=run.filters,
+        total_scraped=run.total_scraped,
+        total_enriched=run.total_enriched,
+        total_warm=run.total_warm,
+        total_cold=run.total_cold,
+        total_no_email=run.total_no_email,
+        total_exported=run.total_exported,
+        error=run.error,
+        started_at=_dt(run.started_at) or "",
+        completed_at=_dt(run.completed_at),
+    )
+
+
+def _lead_response(lead: Lead) -> LeadResponse:
+    return LeadResponse(
+        id=lead.id,
+        full_name=lead.full_name,
+        first_name=lead.first_name,
+        last_name=lead.last_name,
+        title=lead.title,
+        company=lead.company,
+        company_domain=lead.company_domain,
+        email=lead.email,
+        email_confidence=lead.email_confidence,
+        phone=lead.phone,
+        location=lead.location,
+        linkedin_url=lead.linkedin_url,
+        company_linkedin_url=lead.company_linkedin_url,
+        segment=lead.segment.value,
+        intent_score=lead.intent_score,
+        status=lead.status.value,
+        email_sequence_status=getattr(
+            lead,
+            "email_sequence_status",
+            "not_started",
+        ),
+        duplicate_of_lead_id=getattr(lead, "duplicate_of_lead_id", "") or "",
+    )
+
+
+def _universe_payload(universe: LeadUniverse) -> dict:
+    return universe.to_dict()
+
+
+def _segment_payload(segment: LeadSourceSegment) -> dict:
+    data = segment.to_dict()
+    try:
+        data["filters"] = json.loads(segment.filters_json or "{}")
+    except Exception:
+        data["filters"] = {}
+    return data
+
+
+def _event_json(event: AgentEvent) -> dict:
+    return {
+        "event_type": event.event_type.value,
+        "agent_name": event.agent_name,
+        "payload": event.payload,
+        "timestamp": _dt(event.timestamp),
+        "error": event.error,
+    }
+
+
+def _filters(request: StartPipelineRequest) -> dict:
+    return {
+        "titles": request.titles,
+        "industries": request.industries,
+        "geos": request.geos,
+        "company_sizes": request.company_sizes,
+        "keywords": request.keywords,
+        "start_url": request.start_url,
+        "campaign": request.campaign or "",
+        "campaign_key": request.campaign or "",
+    }
+
+
+def _campaign_runs(campaign_filename: str) -> list[PipelineRun]:
+    return run_repo.list_for_campaign(campaign_filename)
+
+
+def _lead_campaign_row(lead: Lead) -> dict:
+    return {
+        "id": lead.id,
+        "run_id": getattr(lead, "run_id", "") or "",
+        "full_name": lead.full_name,
+        "company": lead.company,
+        "title": lead.title,
+        "email": lead.email,
+        "phone": lead.phone,
+        "location": lead.location,
+        "segment": lead.segment.value,
+        "status": lead.status.value,
+        "email_sequence_status": getattr(
+            lead,
+            "email_sequence_status",
+            "not_started",
+        ),
+        "personalised_at": getattr(lead, "personalised_at", "") or "",
+        "email_subject": getattr(lead, "email_subject", "") or "",
+        "email_body": getattr(lead, "email_body", "") or "",
+        "linkedin_message": getattr(lead, "linkedin_message", "") or "",
+        "research_summary": getattr(lead, "research_summary", "") or "",
+        "campaign_name": getattr(lead, "campaign_name", "") or "",
+        "duplicate_of_lead_id": getattr(lead, "duplicate_of_lead_id", "") or "",
+    }
+
+
+def _campaign_lead_rows(
+    campaign_filename: str,
+    segment: Optional[str] = None,
+    run_id: Optional[str] = None,
+    limit: Optional[int] = 500,
+    offset: int = 0,
+    drafts_only: bool = False,
+) -> list[dict]:
+    leads, _total = lead_repo.search(
+        campaign_filename=campaign_filename,
+        segment=segment,
+        limit=limit,
+        offset=offset,
+        run_id=run_id or "",
+        drafts_only=drafts_only,
+    )
+    return [_lead_campaign_row(lead) for lead in leads]
+
+
+def _campaign_lead_payload(row: dict) -> dict:
+    return {
+        "id": row.get("id", ""),
+        "run_id": row.get("run_id", ""),
+        "full_name": row.get("full_name", "") or "",
+        "company": row.get("company", "") or "",
+        "title": row.get("title", "") or "",
+        "email": row.get("email", "") or "",
+        "phone": row.get("phone", "") or "",
+        "location": row.get("location", "") or "",
+        "segment": row.get("segment", "") or "",
+        "status": row.get("status", "") or "",
+        "email_sequence_status": (
+            row.get("email_sequence_status", "") or "not_started"
+        ),
+        "personalised_at": row.get("personalised_at") or "",
+        "duplicate_of_lead_id": row.get("duplicate_of_lead_id", "") or "",
+    }
+
+
+def _campaign_draft_payload(row: dict) -> dict:
+    payload = _campaign_lead_payload(row)
+    payload.update({
+        "email_subject": row.get("email_subject", "") or "",
+        "email_body": row.get("email_body", "") or "",
+        "linkedin_message": row.get("linkedin_message", "") or "",
+        "research_summary": row.get("research_summary", "") or "",
+        "campaign_name": row.get("campaign_name", "") or "",
+    })
+    return payload
+
+
+def _campaign_leads(
+    campaign_filename: str,
+    exclude_run_id: str = "",
+) -> list[Lead]:
+    return lead_repo.get_by_campaign(
+        campaign_filename,
+        exclude_run_id=exclude_run_id,
+    )
+
+
+def _norm_key(value: str) -> str:
+    return "".join(ch for ch in (value or "").lower() if ch.isalnum())
+
+
+def _row_value(row: dict, *names: str) -> str:
+    normalized = {_norm_key(key): value for key, value in row.items()}
+    for name in names:
+        value = normalized.get(_norm_key(name))
+        if value is not None:
+            return str(value).strip()
+    return ""
+
+
+def _norm_url(value: str) -> str:
+    return (
+        (value or "")
+        .strip()
+        .lower()
+        .rstrip("/")
+        .split("?")[0]
+    )
+
+
+def _norm_name_company(name: str, company: str) -> str:
+    return f"{(name or '').strip().lower()}|{(company or '').strip().lower()}"
+
+
+def _normalize_match(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _split_location(row: dict) -> str:
+    location = _row_value(row, "Location", "location")
+    if location:
+        return location
+    parts = [
+        _row_value(row, "City"),
+        _row_value(row, "State"),
+        _row_value(row, "Country"),
+    ]
+    return ", ".join(part for part in parts if part)
+
+
+def _lead_dedupe_keys(lead: Lead) -> list[tuple[str, str]]:
+    keys = []
+    if lead.linkedin_url:
+        keys.append(("url", _norm_url(lead.linkedin_url)))
+    if lead.full_name and lead.company:
+        keys.append(("name_company", _norm_name_company(
+            lead.full_name,
+            lead.company,
+        )))
+    if lead.full_name and (lead.title or lead.location):
+        keys.append((
+            "name_title_location",
+            "|".join([
+                _normalize_match(lead.full_name),
+                _normalize_match(lead.title),
+                _normalize_match(lead.location),
+            ]),
+        ))
+    return [(kind, value) for kind, value in keys if value and value != "||"]
+
+
+def _campaign_dedupe_index(
+    campaign_filename: str,
+    exclude_run_id: str = "",
+) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for lead in _campaign_leads(campaign_filename, exclude_run_id=exclude_run_id):
+        keys.update(_lead_dedupe_keys(lead))
+    return keys
+
+
+def _dedupe_segment_run(
+    campaign_filename: str,
+    run_id: str,
+    universe_id: str,
+    segment_id: str,
+) -> tuple[int, int, int, list[Lead]]:
+    raw_leads = lead_repo.get_by_run(run_id)
+    raw_count = len(raw_leads)
+    seen = _campaign_dedupe_index(campaign_filename, exclude_run_id=run_id)
+    accepted: list[Lead] = []
+    accepted_ids: list[str] = []
+    duplicate_ids: list[str] = []
+
+    for lead in raw_leads:
+        keys = _lead_dedupe_keys(lead)
+        is_duplicate = bool(keys and any(key in seen for key in keys))
+        if is_duplicate:
+            duplicate_ids.append(lead.id)
+            continue
+        accepted.append(lead)
+        accepted_ids.append(lead.id)
+        seen.update(keys)
+
+    duplicate_count = lead_repo.delete_for_run(run_id, duplicate_ids)
+    lead_repo.tag_source(run_id, accepted_ids, universe_id, segment_id)
+    return raw_count, len(accepted), duplicate_count, accepted
+
+
+def _run_segment_now(segment_id: str) -> None:
+    with _segment_runner_lock:
+        if segment_id in _running_segment_ids:
+            return
+        _running_segment_ids.add(segment_id)
+
+        segment = lead_universe_repo.get_segment(segment_id)
+        if not segment:
+            _running_segment_ids.discard(segment_id)
+            return
+
+        universe = lead_universe_repo.get_universe(segment.universe_id)
+        if not universe:
+            lead_universe_repo.update_segment_status(
+                segment.id,
+                "failed",
+                "unknown",
+            )
+            _running_segment_ids.discard(segment_id)
+            return
+
+        if "linkedin.com/sales/search/people" not in segment.source_url.lower():
+            lead_universe_repo.update_segment_status(
+                segment.id,
+                "failed",
+                "unknown",
+            )
+            lead_universe_repo.refresh_universe_totals(segment.universe_id)
+            _running_segment_ids.discard(segment_id)
+            return
+
+        max_leads = max(1, int(segment.expected_count or 50))
+        filters = {
+            "titles": [],
+            "industries": [],
+            "geos": [],
+            "company_sizes": [],
+            "keywords": segment.label,
+            "start_url": segment.source_url,
+            "campaign": segment.campaign_filename,
+            "campaign_key": segment.campaign_filename,
+            "lead_universe_id": segment.universe_id,
+            "lead_source_segment_id": segment.id,
+            "source_segment_label": segment.label,
+        }
+        run = PipelineRun(
+            filters=filters,
+            enrichment_mode=settings.enrichment_mode,
+        )
+        settings.max_leads = max_leads
+        run.status = RunStatus.RUNNING
+        run_repo.save(run)
+        lead_universe_repo.update_segment_status(
+            segment.id,
+            "running",
+            last_run_id=run.id,
+        )
+        lead_universe_repo.refresh_universe_totals(segment.universe_id)
+        event_repo.save(AgentEvent(
+            EventType.PIPELINE_STARTED,
+            "LeadUniverseRunner",
+            run.id,
+            payload={"segment_id": segment.id, "universe_id": universe.id},
+        ))
+
+        try:
+            scraper = ScraperAgent(run, filters)
+            scraper.on_event(lambda event: event_repo.save(event))
+            scraper.execute()
+
+            raw_count, unique_count, duplicate_count, unique_leads = (
+                _dedupe_segment_run(
+                    segment.campaign_filename,
+                    run.id,
+                    segment.universe_id,
+                    segment.id,
+                )
+            )
+
+            segmenter = SegmentAgent(run, unique_leads)
+            segmenter.on_event(lambda event: event_repo.save(event))
+            segmented = segmenter.execute()
+            if segmented:
+                lead_repo.save_batch(run.id, segmented)
+                for lead in segmented:
+                    setattr(lead, "run_id", run.id)
+                    _add_activity(
+                        lead,
+                        segment.campaign_filename,
+                        "lead_scraped",
+                        "Lead scraped from Sales Navigator",
+                        segment.label or segment.source_url,
+                        {
+                            "run_id": run.id,
+                            "segment_id": segment.id,
+                            "source_url": segment.source_url,
+                        },
+                    )
+
+            counts = lead_repo.count_by_segment_for_run(run.id)
+            run.total_scraped = unique_count
+            run.total_enriched = 0
+            run.total_warm = counts["warm"]
+            run.total_cold = counts["cold"]
+            run.total_no_email = counts["no_email"]
+
+            exporter = ExportAgent(run, segmented)
+            exporter.on_event(lambda event: event_repo.save(event))
+            output_files = exporter.execute()
+            run.status = RunStatus.COMPLETED
+            run.completed_at = datetime.utcnow()
+            run_repo.save(run)
+
+            stop_reason = getattr(scraper, "_sales_nav_stop_reason", "unknown")
+            if raw_count == 0 and stop_reason == "unknown":
+                stop_reason = "blocked_or_captcha"
+            status = "completed" if unique_count or raw_count else "exhausted"
+            lead_universe_repo.update_segment_counts(
+                segment.id,
+                raw_count,
+                unique_count,
+                duplicate_count,
+                status,
+                stop_reason,
+                run.id,
+            )
+            lead_universe_repo.refresh_universe_totals(segment.universe_id)
+            event_repo.save(AgentEvent(
+                EventType.PIPELINE_COMPLETED,
+                "LeadUniverseRunner",
+                run.id,
+                payload={
+                    "segment_id": segment.id,
+                    "universe_id": universe.id,
+                    "files": output_files,
+                    "scraped_count": raw_count,
+                    "unique_count": unique_count,
+                    "duplicate_count": duplicate_count,
+                    "stop_reason": stop_reason,
+                },
+            ))
+        except Exception as exc:
+            run.status = RunStatus.FAILED
+            run.error = str(exc)
+            run.completed_at = datetime.utcnow()
+            run_repo.save(run)
+            lead_universe_repo.update_segment_counts(
+                segment.id,
+                segment.scraped_count,
+                segment.unique_count,
+                segment.duplicate_count,
+                "failed",
+                "unknown",
+                run.id,
+            )
+            lead_universe_repo.refresh_universe_totals(segment.universe_id)
+            event_repo.save(AgentEvent(
+                EventType.PIPELINE_FAILED,
+                "LeadUniverseRunner",
+                run.id,
+                payload={"segment_id": segment.id, "universe_id": universe.id},
+                error=str(exc),
+            ))
+            logger.exception("Lead universe segment failed")
+        finally:
+            _running_segment_ids.discard(segment_id)
+
+
+def _start_segment_thread(segment_id: str) -> None:
+    thread = threading.Thread(
+        target=_run_segment_now,
+        args=(segment_id,),
+        daemon=True,
+        name=f"lead-segment-{segment_id[:8]}",
+    )
+    thread.start()
+
+
+def _run_all_segments_now(universe_id: str) -> None:
+    while True:
+        segment = lead_universe_repo.next_queued_segment(universe_id)
+        if not segment:
+            lead_universe_repo.refresh_universe_totals(universe_id)
+            return
+        _run_segment_now(segment.id)
+
+
+async def _read_enriched_rows(file: UploadFile) -> list[dict]:
+    contents = await file.read()
+    filename = (file.filename or "").lower()
+    if filename.endswith(".xlsx"):
+        try:
+            import openpyxl
+
+            workbook = openpyxl.load_workbook(
+                io.BytesIO(contents),
+                read_only=True,
+                data_only=True,
+            )
+            sheet = workbook.active
+            rows = list(sheet.iter_rows(values_only=True))
+            if not rows:
+                return []
+            headers = [str(cell or "").strip() for cell in rows[0]]
+            parsed = []
+            for values in rows[1:]:
+                parsed.append({
+                    headers[idx]: "" if value is None else str(value).strip()
+                    for idx, value in enumerate(values)
+                    if idx < len(headers) and headers[idx]
+                })
+            return parsed
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="openpyxl not installed. Run: pip install openpyxl",
+            ) from exc
+    if filename.endswith(".csv") or not filename:
+        text = contents.decode("utf-8-sig", errors="ignore")
+        return list(csv.DictReader(io.StringIO(text)))
+    raise HTTPException(
+        status_code=400,
+        detail="Only .csv and .xlsx files are supported",
+    )
+
+
+def _update_segments_for_runs(run_ids: set[str]) -> None:
+    for run_id in run_ids:
+        run = run_repo.get(run_id)
+        if not run:
+            continue
+        leads = lead_repo.get_by_run(run_id)
+        segmenter = SegmentAgent(run, leads)
+        segmenter.on_event(lambda event: event_repo.save(event))
+        segmented = segmenter.execute()
+        lead_repo.update_segments(run_id, segmented)
+        run_repo.save(run)
+
+
+def _sequence_delay(settings: dict, touch_number: int, fallback: int) -> int:
+    for touch in settings.get("touches", []):
+        try:
+            if int(touch.get("number", 0)) == touch_number:
+                return int(touch.get("delay_days", fallback))
+        except (TypeError, ValueError):
+            continue
+    return fallback
+
+
+STOPPED_SEQUENCE_STATUSES = {
+    "replied",
+    "bounced",
+    "unsubscribed",
+    "do_not_contact",
+    "completed",
+    "skipped",
+}
+VALID_DRAFT_STATUSES = {
+    "draft",
+    "approved",
+    "scheduled",
+    "sent",
+    "failed",
+    "skipped",
+}
+
+
+def _campaign_value_prop(campaign_filename: str) -> str:
+    campaign = campaign_repo.get_by_filename(campaign_filename) or {}
+    config = campaign.get("config") or {}
+    value = (
+        config.get("email_goal")
+        or config.get("value_proposition")
+        or campaign.get("description")
+        or ""
+    )
+    if value:
+        return str(value)
+    normalized = campaign_filename.replace(".json", "").replace("_", " ").lower()
+    if "fabric" in normalized and "finance" in normalized:
+        return "governed Microsoft Fabric analytics"
+    if "fabric" in normalized:
+        return "unified data and Microsoft Fabric analytics"
+    if "sap" in normalized:
+        return "lower-risk SAP migration and modernization"
+    if "ai" in normalized or "foundry" in normalized:
+        return "secure enterprise AI adoption"
+    return "practical enterprise technology modernization"
+
+
+def _campaign_context(campaign_filename: str) -> dict[str, str]:
+    campaign = campaign_repo.get_by_filename(campaign_filename) or {}
+    config = campaign.get("config") or {}
+    campaign_name = (
+        campaign.get("name")
+        or campaign_filename.replace(".json", "").replace("_", " ")
+    )
+    campaign_goal = (
+        config.get("email_goal")
+        or "book a 20-minute discovery call"
+    )
+    description = campaign.get("description") or ""
+    pain_points = config.get("key_pain_points") or []
+    if isinstance(pain_points, list):
+        pain_points_text = "; ".join(str(point) for point in pain_points if point)
+    else:
+        pain_points_text = str(pain_points)
+    return {
+        "campaign_name": campaign_name,
+        "campaign_description": description,
+        "campaign_goal": campaign_goal,
+        "campaign_pain_points": pain_points_text,
+        "campaign_value_prop": _campaign_value_prop(campaign_filename),
+    }
+
+
+def _followup_goal(step: CampaignSequenceStep, touch_number: int) -> str:
+    if touch_number == 2:
+        return (
+            "Use this email as a concise, helpful reminder that adds one clear reason "
+            "the conversation could be useful."
+        )
+    if touch_number == 3:
+        return (
+            "Use this email to close the loop politely and give the lead an easy way "
+            "to say whether the topic is worth revisiting."
+        )
+    label = step.touch_name or f"Email {touch_number}"
+    return f"Continue the campaign conversation for {label} without repeating the previous email."
+
+
+def _build_followup_body(
+    lead: Lead,
+    campaign_filename: str,
+    previous_sent: OutreachDraft | None,
+    step: CampaignSequenceStep,
+    touch_number: int,
+) -> str:
+    first_name = lead.first_name or (lead.full_name.split()[0] if lead.full_name else "there")
+    previous_subject = previous_sent.subject if previous_sent else "my earlier note"
+    return (
+        f"Hi {first_name or 'there'},\n\n"
+        f"I wanted to follow up on my previous note, {previous_subject}. "
+        f"{_followup_goal(step, touch_number)}\n\n"
+        f"If {_campaign_value_prop(campaign_filename)} is relevant for your team, "
+        "would a quick conversation make sense?\n\n"
+        f"Best,\n{os.getenv('SENDER_NAME', 'Royal Cyber Team')}"
+    )
+
+
+def render_template(
+    template: str,
+    lead: Lead,
+    campaign_filename: str,
+    context: dict | None = None,
+) -> str:
+    context = context or {}
+    campaign_context = _campaign_context(campaign_filename)
+    first_name = lead.first_name or (
+        lead.full_name.split()[0] if lead.full_name else ""
+    )
+    full_name = lead.full_name or first_name or "there"
+    values = {
+        "first_name": first_name or full_name or "there",
+        "full_name": full_name,
+        "company": lead.company or "your team",
+        "title": lead.title or "your role",
+        "location": lead.location or "your market",
+        "lead_context": (
+            lead.title
+            or lead.company
+            or lead.location
+            or "your current priorities"
+        ),
+        "campaign_name": campaign_context["campaign_name"],
+        "campaign_description": campaign_context["campaign_description"],
+        "campaign_goal": campaign_context["campaign_goal"],
+        "campaign_pain_points": campaign_context["campaign_pain_points"],
+        "campaign_value_prop": campaign_context["campaign_value_prop"],
+        "sender_name": os.getenv("SENDER_NAME", "Royal Cyber Team"),
+        "touch1_subject": context.get("touch1_subject") or "my earlier note",
+        "previous_subject": context.get("previous_subject") or "my earlier note",
+        "previous_body": context.get("previous_body") or "",
+        "previous_sent_at": context.get("previous_sent_at") or "",
+        "current_followup_goal": context.get("current_followup_goal") or "",
+    }
+    output = template or ""
+    for key, value in values.items():
+        output = output.replace("{{" + key + "}}", str(value))
+
+    import re
+
+    unresolved = re.findall(r"{{\s*[^}]+\s*}}", output)
+    if unresolved:
+        logger.warning(
+            "Unresolved template variables for lead %s in %s: %s",
+            lead.id,
+            campaign_filename,
+            ", ".join(sorted(set(unresolved))),
+        )
+        output = re.sub(r"{{\s*[^}]+\s*}}", "there", output)
+
+    output = re.sub(
+        r"\b(undefined|None|null)\b",
+        "there",
+        output,
+        flags=re.IGNORECASE,
+    )
+    return output
+
+
+def _render_template(
+    template: str,
+    lead: Lead,
+    campaign_filename: str,
+    touch1_subject: str = "",
+) -> str:
+    return render_template(
+        template,
+        lead,
+        campaign_filename,
+        {"touch1_subject": touch1_subject},
+    )
+
+
+def _draft_payload(row_or_draft) -> dict:
+    if isinstance(row_or_draft, OutreachDraft):
+        draft = row_or_draft
+        lead = lead_repo.get_by_id(draft.lead_id)
+        previous = _previous_sent_draft(
+            draft.lead_id,
+            draft.campaign_filename,
+            draft.touch_number,
+        )
+        return {
+            "draft_id": draft.id,
+            "id": draft.lead_id,
+            "lead_id": draft.lead_id,
+            "run_id": getattr(lead, "run_id", "") if lead else "",
+            "campaign_filename": draft.campaign_filename,
+            "full_name": lead.full_name if lead else "",
+            "company": lead.company if lead else "",
+            "title": lead.title if lead else "",
+            "email": lead.email if lead else "",
+            "touch_number": draft.touch_number,
+            "subject": draft.subject,
+            "email_subject": draft.subject,
+            "body": draft.body,
+            "email_body": draft.body,
+            "linkedin_message": draft.linkedin_message,
+            "status": draft.status,
+            "email_sequence_status": draft.status,
+            "scheduled_for": _dt(draft.scheduled_for),
+            "sent_at": _dt(draft.sent_at),
+            "error_message": draft.error_message,
+            "previous_touch_number": previous.touch_number if previous else None,
+            "previous_subject": previous.subject if previous else "",
+            "previous_body": previous.body if previous else "",
+            "previous_sent_at": _dt(previous.sent_at) if previous else "",
+            "created_at": _dt(draft.created_at),
+            "updated_at": _dt(draft.updated_at),
+        }
+    row = dict(row_or_draft)
+    previous = _previous_sent_draft(
+        row.get("lead_id", ""),
+        row.get("campaign_filename", ""),
+        int(row.get("touch_number") or 1),
+    )
+    return {
+        "draft_id": row.get("draft_id", ""),
+        "id": row.get("lead_id", ""),
+        "lead_id": row.get("lead_id", ""),
+        "run_id": row.get("run_id", ""),
+        "campaign_filename": row.get("campaign_filename", ""),
+        "full_name": row.get("full_name", "") or "",
+        "company": row.get("company", "") or "",
+        "title": row.get("title", "") or "",
+        "email": row.get("email", "") or "",
+        "location": row.get("location", "") or "",
+        "touch_number": row.get("touch_number") or 1,
+        "subject": row.get("subject", "") or "",
+        "email_subject": row.get("subject", "") or "",
+        "body": row.get("body", "") or "",
+        "email_body": row.get("body", "") or "",
+        "linkedin_message": row.get("linkedin_message", "") or "",
+        "status": row.get("status", "") or "draft",
+        "email_sequence_status": row.get("status", "") or "draft",
+        "scheduled_for": row.get("scheduled_for") or "",
+        "sent_at": row.get("sent_at") or "",
+        "error_message": row.get("error_message") or "",
+        "previous_touch_number": previous.touch_number if previous else None,
+        "previous_subject": previous.subject if previous else "",
+        "previous_body": previous.body if previous else "",
+        "previous_sent_at": _dt(previous.sent_at) if previous else "",
+        "created_at": row.get("created_at") or "",
+        "updated_at": row.get("updated_at") or "",
+    }
+
+
+def _activity_payload(row: dict) -> dict:
+    data = dict(row)
+    try:
+        data["metadata"] = json.loads(data.get("metadata_json") or "{}")
+    except Exception:
+        data["metadata"] = {}
+    return data
+
+
+def _add_activity(
+    lead: Lead | None,
+    campaign_filename: str,
+    activity_type: str,
+    title: str,
+    description: str = "",
+    metadata: dict | None = None,
+    run_id: str = "",
+) -> None:
+    if not lead:
+        return
+    outreach_repo.add_activity(LeadActivity(
+        lead_id=lead.id,
+        campaign_filename=campaign_filename,
+        run_id=run_id or getattr(lead, "run_id", "") or "",
+        activity_type=activity_type,
+        title=title,
+        description=description,
+        metadata_json=json.dumps(metadata or {}, default=str),
+    ))
+
+
+def _latest_draft_for_touch(
+    lead_id: str,
+    campaign_filename: str,
+    touch_number: int,
+) -> OutreachDraft | None:
+    return outreach_repo.latest_draft_for_touch(
+        lead_id,
+        campaign_filename,
+        touch_number,
+    )
+
+
+def _touch1_subject(lead_id: str, campaign_filename: str) -> str:
+    return outreach_repo.touch1_subject(lead_id, campaign_filename)
+
+
+def _previous_sent_draft(
+    lead_id: str,
+    campaign_filename: str,
+    touch_number: int,
+) -> OutreachDraft | None:
+    return outreach_repo.previous_sent_draft(
+        lead_id,
+        campaign_filename,
+        touch_number,
+    )
+
+
+def _campaign_lead_ids(campaign_filename: str) -> set[str]:
+    return {lead.id for lead in _campaign_leads(campaign_filename)}
+
+
+def _is_state_stopped(state: LeadSequenceState | None) -> bool:
+    return bool(state and state.status in STOPPED_SEQUENCE_STATUSES)
+
+
+def _set_lead_sequence_columns(
+    lead_id: str,
+    status: str,
+    error: str = "",
+    touch_number: int | None = None,
+    sent_at: datetime | None = None,
+) -> None:
+    lead_repo.update_sequence_status(lead_id, status, error)
+
+
+def _with_unsubscribe_footer(
+    body: str,
+    lead_id: str,
+    email: str,
+) -> tuple[str, str]:
+    unsubscribe_url = make_unsubscribe_url(lead_id, email)
+    one_click_url = f"{unsubscribe_url}/one-click"
+    if unsubscribe_url:
+        body = (
+            f"{body}\n\n--\n"
+            f"{COMPANY_FOOTER_ADDRESS}\n"
+            "If you'd prefer not to hear from us: "
+            f"{unsubscribe_url}"
+        )
+    return body, one_click_url
+
+
+def _validate_generate_drafts_for_leads(
+    campaign_filename: str,
+    touch_number: int,
+) -> CampaignSequenceStep:
+    if touch_number <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="touch_number must be positive",
+        )
+    _load_sequence_settings(campaign_filename)
+    step = campaign_sequence_repo.get_step(
+        campaign_filename,
+        touch_number,
+        active_only=True,
+    )
+    if not step:
+        raise HTTPException(status_code=404, detail="Sequence step not found")
+    return step
+
+
+def _generate_drafts_for_leads(
+    campaign_filename: str,
+    lead_ids: list[str],
+    touch_number: int,
+    overwrite: bool = False,
+) -> dict:
+    step = _validate_generate_drafts_for_leads(campaign_filename, touch_number)
+    campaign_leads = _campaign_lead_ids(campaign_filename)
+    generated = 0
+    skipped = 0
+    skips = []
+
+    for lead_id in lead_ids:
+        lead = lead_repo.get_by_id(lead_id)
+        if not lead or lead.id not in campaign_leads:
+            skipped += 1
+            skips.append({"lead_id": lead_id, "reason": "not_in_campaign"})
+            continue
+        if not lead.email:
+            skipped += 1
+            skips.append({"lead_id": lead_id, "reason": "no_email"})
+            _add_activity(
+                lead,
+                campaign_filename,
+                "skipped",
+                "Draft skipped",
+                "Lead has no email address",
+            )
+            continue
+        state = outreach_repo.get_or_create_state(lead.id, campaign_filename)
+        if _is_state_stopped(state):
+            skipped += 1
+            skips.append({"lead_id": lead.id, "reason": state.status})
+            continue
+
+        previous_step = _previous_active_step(campaign_filename, touch_number)
+        if previous_step and not _sent_draft_exists(
+            lead.id,
+            campaign_filename,
+            previous_step.touch_number,
+        ):
+            skipped += 1
+            skips.append({
+                "lead_id": lead.id,
+                "reason": "previous_touch_not_sent",
+                "required_touch": previous_step.touch_number,
+            })
+            continue
+        if previous_step:
+            if not state.next_touch_due_at:
+                skipped += 1
+                skips.append({"lead_id": lead.id, "reason": "followup_not_scheduled"})
+                continue
+            if state.next_touch_due_at > datetime.utcnow():
+                skipped += 1
+                skips.append({
+                    "lead_id": lead.id,
+                    "reason": "followup_not_due",
+                    "next_touch_due_at": _dt(state.next_touch_due_at),
+                })
+                continue
+
+        existing = outreach_repo.find_active_draft(
+            lead.id,
+            campaign_filename,
+            touch_number,
+        )
+        if existing and not overwrite:
+            skipped += 1
+            skips.append({"lead_id": lead.id, "reason": "duplicate_draft"})
+            continue
+
+        touch1_subject = _touch1_subject(lead.id, campaign_filename)
+        previous_sent = _previous_sent_draft(
+            lead.id,
+            campaign_filename,
+            touch_number,
+        )
+        template_context = {
+            "touch1_subject": touch1_subject,
+            "previous_subject": previous_sent.subject if previous_sent else "",
+            "previous_body": previous_sent.body if previous_sent else "",
+            "previous_sent_at": _dt(previous_sent.sent_at) if previous_sent else "",
+            "current_followup_goal": _followup_goal(step, touch_number),
+            **_campaign_context(campaign_filename),
+        }
+        subject = render_template(
+            step.subject_template,
+            lead,
+            campaign_filename,
+            template_context,
+        )
+        body = render_template(
+            step.email_body_template,
+            lead,
+            campaign_filename,
+            template_context,
+        )
+        if touch_number > 1 and previous_sent and not step.email_body_template.strip():
+            body = _build_followup_body(
+                lead,
+                campaign_filename,
+                previous_sent,
+                step,
+                touch_number,
+            )
+        if (
+            touch_number > 1
+            and previous_sent
+            and body.strip()
+            and body.strip() == previous_sent.body.strip()
+        ):
+            body = _build_followup_body(
+                lead,
+                campaign_filename,
+                previous_sent,
+                step,
+                touch_number,
+            )
+        if existing and overwrite:
+            draft = outreach_repo.update_draft(
+                existing.id,
+                {
+                    "subject": subject,
+                    "body": body,
+                    "linkedin_message": "",
+                    "status": "draft",
+                    "error_message": "",
+                },
+            ) or existing
+        else:
+            draft = OutreachDraft(
+                lead_id=lead.id,
+                campaign_filename=campaign_filename,
+                touch_number=touch_number,
+                subject=subject,
+                body=body,
+                linkedin_message="",
+                status="draft",
+            )
+            outreach_repo.save_draft(draft)
+        state.current_touch = max(state.current_touch, touch_number)
+        state.status = "draft_generated"
+        outreach_repo.upsert_state(state)
+        _set_lead_sequence_columns(lead.id, state.status)
+        _add_activity(
+            lead,
+            campaign_filename,
+            "followup_draft_generated" if touch_number > 1 else "draft_generated",
+            f"Touch {touch_number} draft generated",
+            draft.subject,
+            {
+                "draft_id": draft.id,
+                "touch_number": touch_number,
+                "previous_touch_number": previous_sent.touch_number if previous_sent else None,
+                "previous_subject": previous_sent.subject if previous_sent else "",
+                "previous_sent_at": _dt(previous_sent.sent_at) if previous_sent else "",
+            },
+        )
+        generated += 1
+
+    return {"generated": generated, "skipped": skipped, "skips": skips}
+
+
+def _active_steps(campaign_filename: str) -> list[CampaignSequenceStep]:
+    _load_sequence_settings(campaign_filename)
+    return campaign_sequence_repo.list_steps(campaign_filename, active_only=True)
+
+
+def _next_active_step(
+    campaign_filename: str,
+    current_touch: int,
+) -> CampaignSequenceStep | None:
+    for step in _active_steps(campaign_filename):
+        if step.touch_number > current_touch:
+            return step
+    return None
+
+
+def _previous_active_step(
+    campaign_filename: str,
+    touch_number: int,
+) -> CampaignSequenceStep | None:
+    previous = None
+    for step in _active_steps(campaign_filename):
+        if step.touch_number >= touch_number:
+            break
+        previous = step
+    return previous
+
+
+def _sent_draft_exists(
+    lead_id: str,
+    campaign_filename: str,
+    touch_number: int,
+) -> bool:
+    return outreach_repo.sent_draft_exists(
+        lead_id,
+        campaign_filename,
+        touch_number,
+    )
+
+
+def _parse_clock(value: str, fallback: time) -> time:
+    try:
+        parts = (value or "").split(":")
+        return time(int(parts[0]), int(parts[1] if len(parts) > 1 else 0))
+    except Exception:
+        return fallback
+
+
+def _inside_send_window(rules: CampaignSequenceRules) -> bool:
+    now_time = datetime.now().time()
+    start = _parse_clock(rules.send_window_start, time(9, 0))
+    end = _parse_clock(rules.send_window_end, time(17, 0))
+    if start <= end:
+        return start <= now_time <= end
+    return now_time >= start or now_time <= end
+
+
+def _queued_job_response(job: dict) -> JSONResponse:
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job["id"], "status": job["status"]},
+    )
+
+
+def _defer_draft_send(
+    lead: Lead,
+    draft: OutreachDraft,
+    reason: str,
+    details: list[dict],
+) -> None:
+    """
+    Record a send-policy deferral without changing the draft status.
+
+    Important: the draft remains approved so it can be retried later
+    when the daily cap/window/domain policy allows it.
+    """
+    _add_activity(
+        lead,
+        draft.campaign_filename,
+        "deferred",
+        f"Touch {draft.touch_number} send deferred",
+        reason,
+        {
+            "draft_id": draft.id,
+            "email": lead.email,
+            "touch_number": draft.touch_number,
+        },
+    )
+    details.append({
+        "draft_id": draft.id,
+        "lead_id": lead.id,
+        "email": lead.email,
+        "status": "deferred",
+        "reason": reason,
+        "touch_number": draft.touch_number,
+    })
+
+
+def _defer_remaining_policy_drafts(
+    drafts: list[OutreachDraft],
+    current_index: int,
+    reason: str,
+    details: list[dict],
+) -> int:
+    """
+    Defer remaining approved drafts in this batch after a global stop reason.
+
+    Used for:
+    - Daily cap reached
+    - Outside send window
+
+    Returns how many draft items were deferred.
+    """
+    deferred = 0
+
+    for remaining_draft in drafts[current_index + 1:]:
+        if remaining_draft.status != "approved":
+            continue
+
+        remaining_lead = lead_repo.get_by_id(remaining_draft.lead_id)
+        if not remaining_lead or not remaining_lead.email:
+            continue
+
+        _defer_draft_send(
+            remaining_lead,
+            remaining_draft,
+            reason,
+            details,
+        )
+        deferred += 1
+
+    return deferred
+
+
+def _send_selected_drafts(draft_ids: list[str]) -> dict:
+    sent = 0
+    failed = 0
+    skipped = 0
+    details = []
+    messages: list[str] = []
+    drafts = outreach_repo.get_drafts_by_ids(draft_ids)
+    found_ids = {draft.id for draft in drafts}
+    for missing_id in set(draft_ids) - found_ids:
+        skipped += 1
+        details.append({
+            "draft_id": missing_id,
+            "status": "skipped",
+            "reason": "not_found",
+        })
+
+    sent_by_campaign: dict[str, int] = {}
+
+    for draft_index, draft in enumerate(drafts):
+
+        lead = lead_repo.get_by_id(draft.lead_id)
+        if not lead:
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "lead_not_found",
+            })
+            continue
+        if draft.status != "approved":
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "not_approved",
+            })
+            continue
+        if not lead.email:
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "no_email",
+            })
+            continue
+
+        state = outreach_repo.get_or_create_state(
+            lead.id,
+            draft.campaign_filename,
+        )
+        if _is_state_stopped(state):
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": state.status,
+            })
+            continue
+
+        if _sent_draft_exists(lead.id, draft.campaign_filename, draft.touch_number):
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "already_sent",
+            })
+            continue
+
+        previous_step = _previous_active_step(
+            draft.campaign_filename,
+            draft.touch_number,
+        )
+        if previous_step and not _sent_draft_exists(
+            lead.id,
+            draft.campaign_filename,
+            previous_step.touch_number,
+        ):
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "previous_touch_not_sent",
+                "required_touch": previous_step.touch_number,
+            })
+            continue
+        if previous_step and state.next_touch_due_at and state.next_touch_due_at > datetime.utcnow():
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "followup_not_due",
+                "next_touch_due_at": _dt(state.next_touch_due_at),
+            })
+            continue
+
+        _, rules = campaign_sequence_repo.ensure_defaults(
+            draft.campaign_filename,
+            default_steps=[],
+        )
+        already_sent = outreach_repo.count_sent_today(draft.campaign_filename)
+        already_sent += sent_by_campaign.get(draft.campaign_filename, 0)
+        if already_sent >= rules.daily_send_limit:
+            skipped += 1
+            message = (
+                f"Daily send limit reached for this campaign "
+                f"({rules.daily_send_limit})."
+            )
+            messages.append(message)
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "daily_send_limit_reached",
+                "message": message,
+            })
+            continue
+        if rules.skip_weekends and datetime.now().weekday() >= 5:
+            skipped += 1
+            message = "Weekend sending is blocked by campaign rules."
+            messages.append(message)
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "weekend_send_blocked",
+                "message": message,
+            })
+            continue
+        if not _inside_send_window(rules):
+            skipped += 1
+            message = (
+                "Outside campaign send window. Schedule or send during "
+                f"{rules.send_window_start}-{rules.send_window_end}."
+            )
+            messages.append(message)
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "outside_send_window",
+                "message": message,
+            })
+            continue
+
+        if suppression_repo.is_suppressed(lead.email):
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": "suppressed"},
+            )
+            _add_activity(
+                lead,
+                draft.campaign_filename,
+                "suppressed",
+                "Draft skipped: suppressed",
+                "Email is globally suppressed",
+                {"draft_id": draft.id, "email": lead.email},
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "suppressed",
+            })
+            continue
+
+        allowed, policy_reason = SendPolicy().check(
+            lead.email,
+            draft.campaign_filename,
+        )
+
+        if not allowed:
+            skipped += 1
+            _defer_draft_send(
+                lead,
+                draft,
+                policy_reason,
+                details,
+            )
+
+            if policy_reason.startswith("Daily cap") or (
+                policy_reason == "Outside send window"
+            ):
+                skipped += _defer_remaining_policy_drafts(
+                    drafts,
+                    draft_index,
+                    policy_reason,
+                    details,
+                )
+                messages.append(policy_reason)
+                break
+
+            continue
+
+        if sent_by_campaign.get(draft.campaign_filename, 0) > 0:
+            import time as time_module
+
+            time_module.sleep(next_send_delay_seconds())
+
+        try:
+            send_body, one_click_url = _with_unsubscribe_footer(
+                draft.body,
+                lead.id,
+                lead.email,
+            )
+            success, error = send_via_graph(
+                lead.email,
+                draft.subject,
+                send_body,
+                [
+                    {
+                        "name": "X-List-Unsubscribe",
+                        "value": f"<{one_click_url}>",
+                    },
+                    {
+                        "name": "X-List-Unsubscribe-Post",
+                        "value": "List-Unsubscribe=One-Click",
+                    },
+                ],
+            )
+        except Exception as exc:
+            success, error = False, str(exc)
+        if success:
+            now = datetime.utcnow()
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "sent", "sent_at": now, "error_message": ""},
+            )
+            next_step = _next_active_step(
+                draft.campaign_filename,
+                draft.touch_number,
+            )
+            state.current_touch = draft.touch_number
+            state.last_touch_sent_at = now
+            state.next_touch_due_at = None
+            state.stop_reason = ""
+            if next_step:
+                state.status = "waiting_followup"
+                state.next_touch_due_at = calculate_next_touch_due_at(
+                    now,
+                    next_step,
+                    rules,
+                )
+            else:
+                state.status = "completed"
+                state.completed_at = now
+            outreach_repo.upsert_state(state)
+            _set_lead_sequence_columns(
+                lead.id,
+                state.status,
+                "",
+                draft.touch_number,
+                now,
+            )
+            _add_activity(
+                lead,
+                draft.campaign_filename,
+                "email_sent",
+                f"Touch {draft.touch_number} email sent",
+                draft.subject,
+                {"draft_id": draft.id, "touch_number": draft.touch_number},
+            )
+            send_log_repo.record(
+                lead.id,
+                draft.campaign_filename,
+                lead.email,
+                draft.touch_number,
+            )
+            if next_step:
+                _add_activity(
+                    lead,
+                    draft.campaign_filename,
+                    "followup_due_calculated",
+                    f"Touch {next_step.touch_number} due time calculated",
+                    _dt(state.next_touch_due_at) or "",
+                    {
+                        "previous_touch": draft.touch_number,
+                        "next_touch": next_step.touch_number,
+                        "previous_sent_at": _dt(now),
+                        "due_at": _dt(state.next_touch_due_at),
+                    },
+                )
+                _add_activity(
+                    lead,
+                    draft.campaign_filename,
+                    "followup_scheduled",
+                    f"Touch {next_step.touch_number} scheduled",
+                    _dt(state.next_touch_due_at) or "",
+                    {
+                        "touch_number": next_step.touch_number,
+                        "due_at": _dt(state.next_touch_due_at),
+                    },
+                )
+            else:
+                _add_activity(
+                    lead,
+                    draft.campaign_filename,
+                    "sequence_completed",
+                    "Sequence completed",
+                    f"Final touch {draft.touch_number} sent",
+                    {"draft_id": draft.id, "touch_number": draft.touch_number},
+                )
+            sent_by_campaign[draft.campaign_filename] = (
+                sent_by_campaign.get(draft.campaign_filename, 0) + 1
+            )
+            sent += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "sent",
+                "touch_number": draft.touch_number,
+                "next_touch_due_at": _dt(state.next_touch_due_at),
+            })
+        else:
+            error = error or "Graph API send failed"
+            invalid_recipient = any(
+                marker in error.lower()
+                for marker in (
+                    "invalid recipient",
+                    "recipient",
+                    "does not exist",
+                    "undeliverable",
+                    "bounce",
+                    "invalid email",
+                )
+            )
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "failed", "error_message": error},
+            )
+            if invalid_recipient:
+                suppression_repo.add(
+                    lead.email,
+                    "bounced",
+                    lead.id,
+                    draft.campaign_filename,
+                )
+                state.status = "bounced"
+                state.stop_reason = error
+                state.next_touch_due_at = None
+                state.completed_at = datetime.utcnow()
+                outreach_repo.upsert_state(state)
+                outreach_repo.mark_future_pending_skipped(
+                    lead.id,
+                    draft.campaign_filename,
+                    "bounced",
+                )
+                _set_lead_sequence_columns(lead.id, "bounced", error)
+                _add_activity(
+                    lead,
+                    draft.campaign_filename,
+                    "bounced",
+                    "Lead marked bounced from send error",
+                    error,
+                    {"draft_id": draft.id},
+                )
+            _add_activity(
+                lead,
+                draft.campaign_filename,
+                "failed",
+                f"Touch {draft.touch_number} email failed",
+                error,
+                {"draft_id": draft.id},
+            )
+            failed += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "failed",
+                "reason": error,
+            })
+    message = ""
+    if messages:
+        message = messages[0]
+    return {
+        "sent": sent,
+        "failed": failed,
+        "skipped": skipped,
+        "message": message,
+        "details": details,
+    }
+
+
+def _stop_sequence(
+    lead_id: str,
+    campaign_filename: str,
+    status: str,
+    reason: str,
+) -> dict:
+    lead = lead_repo.get_by_id(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    state = outreach_repo.get_or_create_state(lead_id, campaign_filename)
+    state.status = status
+    state.stop_reason = reason or status
+    state.completed_at = datetime.utcnow()
+    state.next_touch_due_at = None
+    outreach_repo.upsert_state(state)
+    skipped = outreach_repo.mark_future_pending_skipped(
+        lead_id,
+        campaign_filename,
+        reason or status,
+    )
+    lead_repo.update_sequence_status(lead_id, status, reason or status)
+    _add_activity(
+        lead,
+        campaign_filename,
+        status,
+        f"Lead marked {status.replace('_', ' ')}",
+        reason or "",
+        {"skipped_pending_drafts": skipped},
+    )
+    return {
+        "updated": True,
+        "lead_id": lead_id,
+        "campaign_filename": campaign_filename,
+        "status": status,
+        "skipped_pending_drafts": skipped,
+    }
+
+
+def _mark_lead_sequence_status(
+    lead_id: str,
+    request: ManualLeadStatusRequest,
+    status: str,
+) -> dict:
+    campaign_filename = request.campaign_filename
+    reason = request.reason or status
+    result = _stop_sequence(lead_id, campaign_filename, status, reason)
+    lead = lead_repo.get_by_id(lead_id)
+    if lead and lead.email:
+        suppression_reason = {
+            "bounced": "bounced",
+            "unsubscribed": "unsubscribed",
+            "do_not_contact": "manual",
+        }.get(status)
+        if suppression_reason:
+            suppression_repo.add(
+                lead.email,
+                suppression_reason,
+                lead.id,
+                campaign_filename,
+            )
+    return result
+
+__all__ = [name for name in globals() if not name.startswith("__")]
