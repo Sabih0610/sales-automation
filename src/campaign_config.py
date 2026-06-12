@@ -15,9 +15,11 @@ class CampaignConfigModel(BaseModel):
     target_industries: list[str] = Field(default_factory=list)
     tone: str = "professional"
     email_goal: str = "book a 20-minute discovery call"
+    sender_name: str = ""
+    sender_title: str = ""
+    sender_email: str = ""
+    reply_to_email: str = ""
     max_email_words: int = Field(default=150, ge=50, le=400)
-    max_linkedin_chars: int = 280
-    key_pain_points: list[str] = Field(default_factory=list)
 
     @field_validator("tone")
     @classmethod

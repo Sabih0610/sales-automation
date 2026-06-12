@@ -47,6 +47,7 @@ class BaseAgent(ABC):
             )
             return result
         except Exception as exc:
-            self.emit(EventType.AGENT_FAILED, error=str(exc))
+            error_message = str(exc) or repr(exc) or "Unknown agent error"
+            self.emit(EventType.AGENT_FAILED, error=error_message)
             self.logger.exception("Agent failed")
             raise

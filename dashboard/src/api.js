@@ -1,148 +1,170 @@
 import axios from "axios"
 
-const BASE = "http://localhost:8000/api"
-const WS_BASE = "ws://localhost:8000"
+const BASE = import.meta.env.VITE_API_BASE || ""
+const WS_BASE = import.meta.env.VITE_WS_BASE || window.location.origin.replace(/^http/, "ws")
+const API_KEY = import.meta.env.VITE_API_KEY || ""
 
-const api = axios.create({ baseURL: BASE })
+const client = axios.create({
+  baseURL: BASE,
+  headers: { "X-API-Key": API_KEY },
+})
 
-export const getRuns = () => api.get("/runs")
-export const getRun = (id) => api.get(`/runs/${id}`)
-export const startRun = (body) => api.post("/runs/start", body)
-export const getRunLeads = (id, params) => api.get(`/runs/${id}/leads`, { params })
-export const getRunEvents = (id) => api.get(`/runs/${id}/events`)
-export const exportRun = (id) => api.get(`/runs/${id}/leads/export`)
-export const getEmailStatus = (id) => api.get(`/runs/${id}/email-status`)
-export const getEmailPreview = (runId) =>
-  api.get(`/runs/${runId}/email-preview`)
-export const personaliseRun = (runId, body) =>
-  api.post(`/runs/${runId}/personalise`, body)
-export const getDrafts = (runId, campaignName = "") =>
-  api.get(`/runs/${runId}/drafts`, {
-    params: campaignName ? { campaign_name: campaignName } : {},
-  })
-export const updateDraft = (runId, leadId, body) =>
-  api.post(`/runs/${runId}/drafts/${leadId}/update`, body)
-export const sendTestCopy = (runId, leadId, body) =>
-  api.post(`/runs/${runId}/drafts/${leadId}/send-test-copy`, body)
-export const sendEmails = (runId, leadIds = []) =>
-  api.post(`/runs/${runId}/send-emails`, { lead_ids: leadIds })
-export const downloadForZoominfo = (id) => `${BASE}/runs/${id}/leads/download-for-zoominfo`
+const wsUrl = (path) => {
+  const base = WS_BASE.replace(/\/$/, "")
+  const separator = path.includes("?") ? "&" : "?"
+  return `${base}${path}${separator}api_key=${encodeURIComponent(API_KEY)}`
+}
+
+export async function downloadFile(path, filename) {
+  const resp = await client.get(path, { responseType: "blob" })
+  const url = URL.createObjectURL(resp.data)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+export const friendlyMessage = (err) => err.response?.data?.detail || err.message
+
+export const getDashboardSummary = () => client.get("/api/dashboard/summary")
+export const getRun = (id) => client.get(`/api/runs/${id}`)
+export const startRun = (body) => client.post("/api/runs/start", body)
+export const getRunLeads = (id, params) => client.get(`/api/runs/${id}/leads`, { params })
+export const getRunEvents = (id) => client.get(`/api/runs/${id}/events`)
+export const exportRun = (id) => client.get(`/api/runs/${id}/leads/export`)
 export const uploadEnrichedCsv = (id, file) => {
   const form = new FormData()
   form.append("file", file)
-  return api.post(`/runs/${id}/leads/upload-enriched`, form)
+  return client.post(`/api/runs/${id}/leads/upload-enriched`, form)
 }
-export const getCampaigns = () => api.get("/campaigns")
+export const getCampaigns = () => client.get("/api/campaigns")
 export const getCampaignOverview = (filename) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/overview`)
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/overview`)
+
+export const getCampaignReport = (filename, params = {}) =>
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/report`, { params })
+
+export const getCampaignsSummary = () =>
+  client.get("/api/campaigns/summary")
+
 export const getCampaignLeads = (filename, params = {}) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/leads`, { params })
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/leads`, { params })
 export const generateCampaignDrafts = (filename, data) =>
-  api.post(`/campaigns/${encodeURIComponent(filename)}/drafts/generate`, data)
+  client.post(`/api/campaigns/${encodeURIComponent(filename)}/drafts/generate`, data)
 export const getCampaignDrafts = (filename, params = {}) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/drafts`, { params })
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/drafts`, { params })
 export const updateOutreachDraft = (draftId, data) =>
-  api.put(`/drafts/${draftId}`, data)
+  client.put(`/api/drafts/${draftId}`, data)
 export const approveDraft = (draftId) =>
-  api.post(`/drafts/${draftId}/approve`)
+  client.post(`/api/drafts/${draftId}/approve`)
 export const approveSelectedDrafts = (draftIdsOrBody) =>
-  api.post(
-    "/drafts/approve-selected",
+  client.post(
+    "/api/drafts/approve-selected",
     Array.isArray(draftIdsOrBody) ? { draft_ids: draftIdsOrBody } : draftIdsOrBody,
   )
 export const skipDraft = (draftId, reasonOrBody = "") =>
-  api.post(
-    `/drafts/${draftId}/skip`,
+  client.post(
+    `/api/drafts/${draftId}/skip`,
     typeof reasonOrBody === "string" ? { reason: reasonOrBody } : reasonOrBody,
   )
 export const sendSelectedDrafts = (draftIdsOrBody) =>
-  api.post(
-    "/drafts/send-selected",
+  client.post(
+    "/api/drafts/send-selected",
     Array.isArray(draftIdsOrBody) ? { draft_ids: draftIdsOrBody } : draftIdsOrBody,
   )
 export const sendDraftTest = (draftId, testEmailOrBody) =>
-  api.post(
-    `/drafts/${draftId}/send-test`,
+  client.post(
+    `/api/drafts/${draftId}/send-test`,
     typeof testEmailOrBody === "string"
       ? { test_email: testEmailOrBody }
       : testEmailOrBody,
   )
 export const getCampaignQueue = (filename) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/queue`)
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/queue`)
 export const generateDueDrafts = (filename, data = {}) =>
-  api.post(`/campaigns/${encodeURIComponent(filename)}/queue/generate-due`, data)
+  client.post(`/api/campaigns/${encodeURIComponent(filename)}/queue/generate-due`, data)
 export const sendCampaignQueueSelected = (filename, draftIdsOrBody) =>
-  api.post(
-    `/campaigns/${encodeURIComponent(filename)}/queue/send-selected`,
+  client.post(
+    `/api/campaigns/${encodeURIComponent(filename)}/queue/send-selected`,
     Array.isArray(draftIdsOrBody) ? { draft_ids: draftIdsOrBody } : draftIdsOrBody,
   )
 export const getCampaignActivities = (filename, params = {}) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/activities`, { params })
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/activities`, { params })
 export const getLeadActivities = (leadId, params = {}) =>
-  api.get(`/leads/${leadId}/activities`, { params })
+  client.get(`/api/leads/${leadId}/activities`, { params })
 export const markLeadReplied = (leadId, data) =>
-  api.post(`/leads/${leadId}/mark-replied`, data)
+  client.post(`/api/leads/${leadId}/mark-replied`, data)
 export const markLeadBounced = (leadId, data) =>
-  api.post(`/leads/${leadId}/mark-bounced`, data)
+  client.post(`/api/leads/${leadId}/mark-bounced`, data)
 export const markLeadUnsubscribed = (leadId, data) =>
-  api.post(`/leads/${leadId}/mark-unsubscribed`, data)
+  client.post(`/api/leads/${leadId}/mark-unsubscribed`, data)
 export const markLeadDoNotContact = (leadId, data) =>
-  api.post(`/leads/${leadId}/mark-do-not-contact`, data)
-export const exportCampaignZoomInfo = (filename) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/export-zoominfo`, {
-    responseType: "blob",
-  })
+  client.post(`/api/leads/${leadId}/mark-do-not-contact`, data)
 export const uploadCampaignEnriched = (filename, file) => {
   const form = new FormData()
   form.append("file", file)
-  return api.post(
-    `/campaigns/${encodeURIComponent(filename)}/upload-enriched`,
+  return client.post(
+    `/api/campaigns/${encodeURIComponent(filename)}/upload-enriched`,
     form,
     { headers: { "Content-Type": "multipart/form-data" } }
   )
 }
+export const verifyCampaignEmails = (filename, params = {}) =>
+  client
+    .post(`/api/campaigns/${encodeURIComponent(filename)}/verify-emails`, null, {
+      params,
+    })
+    .then((response) => response.data)
 export const getCampaignRuns = (filename) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/runs`)
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/runs`)
 export const getCampaignLeadUniverses = (filename) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/lead-universes`)
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/lead-universes`)
 export const createLeadUniverse = (data) =>
-  api.post("/lead-universes", data)
+  client.post("/api/lead-universes", data)
 export const addLeadSourceSegment = (universeId, data) =>
-  api.post(`/lead-universes/${universeId}/segments`, data)
+  client.post(`/api/lead-universes/${universeId}/segments`, data)
 export const runLeadSourceSegment = (segmentId) =>
-  api.post(`/segments/${segmentId}/run`)
+  client.post(`/api/segments/${segmentId}/run`)
 export const runNextLeadSourceSegment = (universeId) =>
-  api.post(`/lead-universes/${universeId}/run-next`)
+  client.post(`/api/lead-universes/${universeId}/run-next`)
 export const runAllLeadSourceSegments = (universeId) =>
-  api.post(`/lead-universes/${universeId}/run-all`)
+  client.post(`/api/lead-universes/${universeId}/run-all`)
 export const pauseLeadSourceSegments = (universeId) =>
-  api.post(`/lead-universes/${universeId}/pause-all`)
+  client.post(`/api/lead-universes/${universeId}/pause-all`)
 export const getSequenceSettings = (filename) =>
-  api.get(`/campaigns/${encodeURIComponent(filename)}/sequence-settings`)
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/sequence-settings`)
 export const saveSequenceSettings = (filename, data) =>
-  api.post(`/campaigns/${encodeURIComponent(filename)}/sequence-settings`, data)
-export const getKnowledgeBases = () => api.get("/knowledge-bases")
+  client.post(`/api/campaigns/${encodeURIComponent(filename)}/sequence-settings`, data)
+export const getKnowledgeBases = () => client.get("/api/knowledge-bases")
 export const uploadKnowledgeBase = (file) => {
   const form = new FormData()
   form.append("file", file)
-  return api.post("/knowledge-bases/upload", form)
+  return client.post("/api/knowledge-bases/upload", form)
 }
-export const getAllLeads = (params) => api.get("/leads", { params })
-export const getStats = () => api.get("/stats")
-export const sendEmailsAll = (campaign) => api.post("/sequences/send", { campaign })
-export const getSequenceStats = () => api.get("/sequences/stats")
-export const updateEmailContent = (leadId, data) =>
-  api.put(`/leads/${leadId}/email-content`, data)
-export const sendSingleEmail = (leadId) =>
-  api.post(`/leads/${leadId}/send-email`)
+export const getSchedulerStatus = () => client.get("/api/scheduler/status")
+export const getSendPolicyStatus = () => client.get("/api/send-policy/status")
+
+export const updateCampaign = (filename, data) =>
+  client.patch(`/api/campaigns/${encodeURIComponent(filename)}`, data)
+
 export const createCampaign = (data) =>
-  api.post("/campaigns", data)
+  client.post("/api/campaigns", data)
 export const loadSettings = () =>
-  api.get("/settings")
+  client.get("/api/settings")
+export const saveSettings = (data) =>
+  client.post("/api/settings", data)
+export const testSettingsEmail = () =>
+  client.post("/api/settings/test-email")
+export const getJob = (id) => client.get(`/api/jobs/${id}`)
+export const getJobs = (limit = 20) => client.get("/api/jobs", { params: { limit } })
+export const cancelJob = (id) => client.post(`/api/jobs/${id}/cancel`)
 export const openWS = (runId, onMsg) => {
-  const ws = new WebSocket(`${WS_BASE}/ws/runs/${runId}`)
+  const ws = new WebSocket(wsUrl(`/ws/runs/${runId}`))
   ws.onmessage = (e) => onMsg(JSON.parse(e.data))
   return ws
 }
 
-export default api
+export default client

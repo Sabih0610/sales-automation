@@ -2158,11 +2158,15 @@ el => Boolean(
                 self.logger.exception(
                     f"Phase 2 extraction failed for page {page_num}: {exc}"
                 )
-                self.emit(EventType.AGENT_FAILED, {
-                    "page": page_num,
-                    "error": str(exc),
-                    "stage": "phase2_extract",
-                })
+                error_message = str(exc) or repr(exc) or "Unknown extraction error"
+                self.emit(
+                    EventType.AGENT_FAILED,
+                    payload={
+                        "page": page_num,
+                        "stage": "phase2_extract",
+                    },
+                    error=error_message,
+                )
                 self._write_page_error(page_num, raw_text, exc)
                 return []
 
@@ -2199,13 +2203,32 @@ el => Boolean(
         page_num = 1
 
         chrome_paths = [
+            os.getenv("CHROME_PATH", "").strip(),
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.join(
+                os.getenv("LOCALAPPDATA", ""),
+                "Google",
+                "Chrome",
+                "Application",
+                "chrome.exe",
+            ),
+            os.path.join(
+                os.getenv("PROGRAMFILES", ""),
+                "Google",
+                "Chrome",
+                "Application",
+                "chrome.exe",
+            ),
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
         ]
+
         chrome_exe = next(
-            (path for path in chrome_paths if os.path.exists(path)), None
+            (path for path in chrome_paths if path and os.path.exists(path)),
+            None,
         )
 
         with sync_playwright() as pw:
@@ -2224,9 +2247,32 @@ el => Boolean(
                     "--start-maximized",
                 ])
                 time.sleep(3)
-                browser = pw.chromium.connect_over_cdp(
-                    "http://localhost:9222"
-                )
+
+                browser = None
+                last_cdp_error = ""
+
+                for attempt in range(5):
+                    try:
+                        browser = pw.chromium.connect_over_cdp(
+                            "http://127.0.0.1:9222",
+                            timeout=5000,
+                        )
+                        break
+                    except Exception as cdp_exc:
+                        last_cdp_error = str(cdp_exc) or repr(cdp_exc)
+                        self.logger.warning(
+                            f"CDP connect attempt {attempt + 1}/5 failed: "
+                            f"{last_cdp_error}"
+                        )
+                        time.sleep(2)
+
+                if browser is None:
+                    raise RuntimeError(
+                        "Could not connect to Chrome on port 9222 after 5 attempts. "
+                        f"Last error: {last_cdp_error}. "
+                        "Close existing scraper Chrome windows or check CHROME_PATH."
+                    )
+
                 context = (
                     browser.contexts[0]
                     if browser.contexts
@@ -2387,11 +2433,15 @@ el => Boolean(
                 self.logger.exception(
                     f"Phase 2 extraction failed for page {page_num}: {exc}"
                 )
-                self.emit(EventType.AGENT_FAILED, {
-                    "page": page_num,
-                    "error": str(exc),
-                    "stage": "phase2_extract",
-                })
+                error_message = str(exc) or repr(exc) or "Unknown extraction error"
+                self.emit(
+                    EventType.AGENT_FAILED,
+                    payload={
+                        "page": page_num,
+                        "stage": "phase2_extract",
+                    },
+                    error=error_message,
+                )
                 self._write_page_error(page_num, raw_text, exc)
                 return []
 

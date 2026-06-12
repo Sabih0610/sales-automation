@@ -253,6 +253,13 @@ class CreateCampaignRequest(CampaignConfigModel):
     description: str = ""
 
 
+class CampaignUpdateRequest(BaseModel):
+    sender_name: Optional[str] = None
+    sender_title: Optional[str] = None
+    sender_email: Optional[str] = None
+    reply_to_email: Optional[str] = None
+
+
 class CreateLeadUniverseRequest(BaseModel):
     name: str
     campaign_filename: str
@@ -611,22 +618,38 @@ def _campaign_lead_rows(
 
 
 def _campaign_lead_payload(row: dict) -> dict:
+    email = row.get("email", "") or ""
+
     return {
         "id": row.get("id", ""),
         "run_id": row.get("run_id", ""),
         "full_name": row.get("full_name", "") or "",
         "company": row.get("company", "") or "",
         "title": row.get("title", "") or "",
-        "email": row.get("email", "") or "",
+        "email": email,
+        "email_confidence": row.get("email_confidence", "") or "",
+        "email_verification_status": row.get("email_verification_status") or "",
+        "email_verification_reason": row.get("email_verification_reason") or "",
+        "email_verification_checked_at": row.get("email_verification_checked_at") or "",
         "phone": row.get("phone", "") or "",
         "location": row.get("location", "") or "",
+        "linkedin_url": row.get("linkedin_url", "") or "",
+        "company_linkedin_url": row.get("company_linkedin_url", "") or "",
         "segment": row.get("segment", "") or "",
         "status": row.get("status", "") or "",
         "email_sequence_status": (
             row.get("email_sequence_status", "") or "not_started"
         ),
+        "sequence_status": (
+            row.get("sequence_status")
+            or row.get("email_sequence_status")
+            or "not_started"
+        ),
         "personalised_at": row.get("personalised_at") or "",
         "duplicate_of_lead_id": row.get("duplicate_of_lead_id", "") or "",
+        "last_activity_at": row.get("last_activity_at") or "",
+        "last_activity_title": row.get("last_activity_title") or "",
+        "is_suppressed": suppression_repo.is_suppressed(email) if email else False,
     }
 
 
@@ -1020,6 +1043,92 @@ VALID_DRAFT_STATUSES = {
     "skipped",
 }
 
+def _safe_json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def _campaign_config_for_review(campaign_filename: str) -> dict:
+    campaign = campaign_repo.get_by_filename(campaign_filename) or {}
+    config = campaign.get("config") or {}
+    return config if isinstance(config, dict) else {}
+
+
+def compute_risk_flags(
+    subject: str,
+    body: str,
+    lead,
+    campaign_config: dict,
+    research_summary: str = "",
+) -> list[str]:
+    flags: list[str] = []
+    text = f"{subject or ''}\n{body or ''}"
+
+    if "{{" in text or "}}" in text:
+        flags.append("template_leak")
+
+    first_name = (getattr(lead, "first_name", "") or "").strip()
+    if not first_name or first_name.lower() not in (body or "").lower():
+        flags.append("missing_first_name")
+
+    try:
+        max_words = int((campaign_config or {}).get("max_email_words", 200) or 200)
+    except Exception:
+        max_words = 200
+
+    if len((body or "").split()) > max_words:
+        flags.append("too_long")
+
+    company = (getattr(lead, "company", "") or "").strip()
+    if not (research_summary or "").strip() and (
+        not company or company.lower() not in (body or "").lower()
+    ):
+        flags.append("no_personalisation")
+
+    email_verification_status = (
+        getattr(lead, "email_verification_status", "") or ""
+    ).lower()
+    if email_verification_status in {"risky", "invalid"}:
+        flags.append("risky_email")
+
+    return flags
+
+
+def _draft_review_updates(
+    lead,
+    campaign_filename: str,
+    subject: str,
+    body: str,
+    research_summary: str = "",
+    kb_sources: list | None = None,
+) -> dict:
+    campaign_config = _campaign_config_for_review(campaign_filename)
+
+    if kb_sources is None:
+        kb_sources = campaign_config.get("knowledge_bases") or []
+    if not isinstance(kb_sources, list):
+        kb_sources = []
+
+    risk_flags = compute_risk_flags(
+        subject=subject,
+        body=body,
+        lead=lead,
+        campaign_config=campaign_config,
+        research_summary=research_summary,
+    )
+
+    return {
+        "research_summary": research_summary or "",
+        "kb_sources": json.dumps(kb_sources),
+        "risk_flags": json.dumps(risk_flags),
+    }
 
 def _campaign_value_prop(campaign_filename: str) -> str:
     campaign = campaign_repo.get_by_filename(campaign_filename) or {}
@@ -1043,6 +1152,44 @@ def _campaign_value_prop(campaign_filename: str) -> str:
         return "secure enterprise AI adoption"
     return "practical enterprise technology modernization"
 
+def _campaign_sender_identity(campaign_filename: str) -> dict[str, str]:
+    campaign = campaign_repo.get_by_filename(campaign_filename) or {}
+    config = campaign.get("config") or {}
+
+    sender_email = (
+        config.get("sender_email")
+        or os.getenv("SENDER_EMAIL", "")
+        or ""
+    ).strip()
+
+    reply_to_email = (
+        config.get("reply_to_email")
+        or sender_email
+        or os.getenv("SENDER_EMAIL", "")
+        or ""
+    ).strip()
+
+    return {
+        "sender_name": (
+            config.get("sender_name")
+            or os.getenv("SENDER_NAME", "Royal Cyber Team")
+            or "Royal Cyber Team"
+        ).strip(),
+        "sender_title": (config.get("sender_title") or "").strip(),
+        "sender_email": sender_email,
+        "reply_to_email": reply_to_email,
+    }
+
+
+def _campaign_sender_signature(campaign_filename: str) -> str:
+    sender = _campaign_sender_identity(campaign_filename)
+    lines = [sender["sender_name"] or "Royal Cyber Team"]
+
+    if sender.get("sender_title"):
+        lines.append(sender["sender_title"])
+
+    return "\n".join(lines)
+
 
 def _campaign_context(campaign_filename: str) -> dict[str, str]:
     campaign = campaign_repo.get_by_filename(campaign_filename) or {}
@@ -1061,12 +1208,20 @@ def _campaign_context(campaign_filename: str) -> dict[str, str]:
         pain_points_text = "; ".join(str(point) for point in pain_points if point)
     else:
         pain_points_text = str(pain_points)
+
+    sender = _campaign_sender_identity(campaign_filename)
+
     return {
         "campaign_name": campaign_name,
         "campaign_description": description,
         "campaign_goal": campaign_goal,
         "campaign_pain_points": pain_points_text,
         "campaign_value_prop": _campaign_value_prop(campaign_filename),
+        "sender_name": sender["sender_name"],
+        "sender_title": sender["sender_title"],
+        "sender_email": sender["sender_email"],
+        "reply_to_email": sender["reply_to_email"],
+        "sender_signature": _campaign_sender_signature(campaign_filename),
     }
 
 
@@ -1100,7 +1255,7 @@ def _build_followup_body(
         f"{_followup_goal(step, touch_number)}\n\n"
         f"If {_campaign_value_prop(campaign_filename)} is relevant for your team, "
         "would a quick conversation make sense?\n\n"
-        f"Best,\n{os.getenv('SENDER_NAME', 'Royal Cyber Team')}"
+        f"Best,\n{_campaign_sender_signature(campaign_filename)}"
     )
 
 
@@ -1133,7 +1288,11 @@ def render_template(
         "campaign_goal": campaign_context["campaign_goal"],
         "campaign_pain_points": campaign_context["campaign_pain_points"],
         "campaign_value_prop": campaign_context["campaign_value_prop"],
-        "sender_name": os.getenv("SENDER_NAME", "Royal Cyber Team"),
+        "sender_name": campaign_context["sender_name"],
+        "sender_title": campaign_context["sender_title"],
+        "sender_email": campaign_context["sender_email"],
+        "reply_to_email": campaign_context["reply_to_email"],
+        "sender_signature": campaign_context["sender_signature"],
         "touch1_subject": context.get("touch1_subject") or "my earlier note",
         "previous_subject": context.get("previous_subject") or "my earlier note",
         "previous_body": context.get("previous_body") or "",
@@ -1209,6 +1368,9 @@ def _draft_payload(row_or_draft) -> dict:
             "scheduled_for": _dt(draft.scheduled_for),
             "sent_at": _dt(draft.sent_at),
             "error_message": draft.error_message,
+            "research_summary": draft.research_summary or "",
+            "kb_sources": _safe_json_list(draft.kb_sources),
+            "risk_flags": _safe_json_list(draft.risk_flags),
             "previous_touch_number": previous.touch_number if previous else None,
             "previous_subject": previous.subject if previous else "",
             "previous_body": previous.body if previous else "",
@@ -1244,6 +1406,9 @@ def _draft_payload(row_or_draft) -> dict:
         "scheduled_for": row.get("scheduled_for") or "",
         "sent_at": row.get("sent_at") or "",
         "error_message": row.get("error_message") or "",
+        "research_summary": row.get("research_summary") or "",
+        "kb_sources": _safe_json_list(row.get("kb_sources")),
+        "risk_flags": _safe_json_list(row.get("risk_flags")),
         "previous_touch_number": previous.touch_number if previous else None,
         "previous_subject": previous.subject if previous else "",
         "previous_body": previous.body if previous else "",
@@ -1486,6 +1651,14 @@ def _generate_drafts_for_leads(
                 step,
                 touch_number,
             )
+        review_updates = _draft_review_updates(
+            lead=lead,
+            campaign_filename=campaign_filename,
+            subject=subject,
+            body=body,
+            research_summary="",
+        )
+
         if existing and overwrite:
             draft = outreach_repo.update_draft(
                 existing.id,
@@ -1495,6 +1668,7 @@ def _generate_drafts_for_leads(
                     "linkedin_message": "",
                     "status": "draft",
                     "error_message": "",
+                    **review_updates,
                 },
             ) or existing
         else:
@@ -1506,6 +1680,9 @@ def _generate_drafts_for_leads(
                 body=body,
                 linkedin_message="",
                 status="draft",
+                research_summary=review_updates["research_summary"],
+                kb_sources=review_updates["kb_sources"],
+                risk_flags=review_updates["risk_flags"],
             )
             outreach_repo.save_draft(draft)
         state.current_touch = max(state.current_touch, touch_number)
@@ -1693,6 +1870,27 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
                 "reason": "lead_not_found",
             })
             continue
+        if lead and (getattr(lead, "email_verification_status", "") or "").lower() == "invalid":
+            outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "failed",
+                    "error_message": (
+                        "Blocked: email verification marked this address invalid "
+                        f"({getattr(lead, 'email_verification_reason', '') or 'invalid'})."
+                    ),
+                },
+            )
+            details.append(
+                {
+                    "draft_id": draft.id,
+                    "status": "failed",
+                    "reason": "invalid_email",
+                    "message": "Email verification marked this address invalid.",
+                }
+            )
+            failed += 1
+            continue
         if draft.status != "approved":
             skipped += 1
             details.append({
@@ -1876,6 +2074,8 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
                 lead.id,
                 lead.email,
             )
+            sender_identity = _campaign_sender_identity(draft.campaign_filename)
+
             success, error = send_via_graph(
                 lead.email,
                 draft.subject,
@@ -1890,6 +2090,8 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
                         "value": "List-Unsubscribe=One-Click",
                     },
                 ],
+                sender_email=sender_identity["sender_email"],
+                reply_to_email=sender_identity["reply_to_email"],
             )
         except Exception as exc:
             success, error = False, str(exc)

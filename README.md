@@ -54,6 +54,36 @@ npm run dev
 
 Open the Vite URL shown in the terminal, usually `http://127.0.0.1:5173`.
 
+## Database Migrations
+
+This project uses plain SQL migrations for the local SQLite database
+`pipeline.db`. Migrations live in `migrations/` and are applied automatically
+when the app opens the database through `src/storage.py`.
+
+To add a migration, create the next numbered file, for example:
+
+```text
+migrations/0005_add_example_column.sql
+```
+
+Use normal SQLite SQL in the file. For compatibility `ALTER TABLE` migrations
+that may run against databases already changed by older runtime code, put
+`-- tolerant` on the first line so duplicate-column/no-such-column errors are
+logged and skipped. This migration runner is local SQLite only; it does not use
+an external database, ORM, or Alembic.
+
+## Campaign Definitions
+
+Campaign definitions are stored in the local SQLite database table
+`campaigns`, using the legacy `filename` value in URLs and related tables.
+The JSON files in `campaigns/*.json` are deprecated import seeds only. On
+startup, the app imports them once into `pipeline.db` and records the
+`campaigns_imported_v1` flag in `kv_store`.
+
+New campaigns should be created through the dashboard/API so they are written
+to SQLite. Sequence steps are stored in `campaign_sequence_steps`; the old
+`campaigns/sequences.json` file is no longer used after import.
+
 ## Enrichment Modes
 
 | Mode | `.env` setting | Behavior |

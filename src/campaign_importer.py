@@ -9,6 +9,51 @@ from src.storage import campaign_repo, campaign_sequence_repo, kv_repo
 logger = logging.getLogger(__name__)
 IMPORT_KEY = "campaigns_imported_v1"
 
+DEFAULT_SEQUENCE_STEPS = [
+    {
+        "number": 1,
+        "name": "Email 1",
+        "delay_days": 0,
+        "delay_value": 0,
+        "delay_unit": "days",
+        "delay_type": "calendar_days",
+        "send_time_mode": "same_as_previous",
+        "fixed_send_time": "",
+        "subject_template": "",
+        "email_body_template": "",
+        "linkedin_message_template": "",
+        "is_active": True,
+    },
+    {
+        "number": 2,
+        "name": "Follow-up 1",
+        "delay_days": 3,
+        "delay_value": 3,
+        "delay_unit": "days",
+        "delay_type": "calendar_days",
+        "send_time_mode": "same_as_previous",
+        "fixed_send_time": "",
+        "subject_template": "",
+        "email_body_template": "",
+        "linkedin_message_template": "",
+        "is_active": True,
+    },
+    {
+        "number": 3,
+        "name": "Follow-up 2",
+        "delay_days": 7,
+        "delay_value": 7,
+        "delay_unit": "days",
+        "delay_type": "calendar_days",
+        "send_time_mode": "same_as_previous",
+        "fixed_send_time": "",
+        "subject_template": "",
+        "email_body_template": "",
+        "linkedin_message_template": "",
+        "is_active": True,
+    },
+]
+
 
 def _campaign_filename(value: str) -> str:
     value = (value or "").strip()
@@ -86,12 +131,32 @@ def _import_sequences_file(path: Path) -> None:
                 )
 
 
+def _ensure_default_sequences_for_imported_campaigns() -> None:
+    for campaign in campaign_repo.list_all():
+        campaign_filename = campaign.get("filename") or ""
+        if not campaign_filename:
+            continue
+
+        try:
+            campaign_sequence_repo.ensure_defaults(
+                campaign_filename,
+                DEFAULT_SEQUENCE_STEPS,
+            )
+        except Exception:
+            logger.exception(
+                "Failed ensuring default sequence settings for %s",
+                campaign_filename,
+            )
+
+
 def import_campaign_seed_files_once() -> None:
     if kv_repo.get(IMPORT_KEY):
+        _ensure_default_sequences_for_imported_campaigns()
         return
 
     campaigns_dir = Path("campaigns")
     if not campaigns_dir.exists():
+        _ensure_default_sequences_for_imported_campaigns()
         kv_repo.set(IMPORT_KEY, "1")
         return
 
@@ -101,5 +166,6 @@ def import_campaign_seed_files_once() -> None:
         _import_campaign_file(path)
 
     _import_sequences_file(campaigns_dir / "sequences.json")
+    _ensure_default_sequences_for_imported_campaigns()
     kv_repo.set(IMPORT_KEY, "1")
     logger.info("Campaign seed import complete")

@@ -77,6 +77,18 @@ def update_outreach_draft(
         updates["status"] = request.status
     updated = outreach_repo.update_draft(draft_id, updates)
     lead = lead_repo.get_by_id(draft.lead_id)
+
+    if updated and ("subject" in updates or "body" in updates):
+        review_updates = _draft_review_updates(
+            lead=lead,
+            campaign_filename=updated.campaign_filename,
+            subject=updated.subject,
+            body=updated.body,
+            research_summary=updated.research_summary,
+            kb_sources=_safe_json_list(updated.kb_sources),
+        )
+        updated = outreach_repo.update_draft(updated.id, review_updates) or updated
+
     _add_activity(
         lead,
         draft.campaign_filename,
@@ -199,11 +211,15 @@ def send_outreach_draft_test(
         "----\n\n"
         f"{draft.body}"
     )
+    sender_identity = _campaign_sender_identity(draft.campaign_filename)
     success, error = send_via_graph(
         test_email,
         test_subject,
         test_body,
+        sender_email=sender_identity["sender_email"],
+        reply_to_email=sender_identity["reply_to_email"],
     )
+    
     _add_activity(
         lead,
         draft.campaign_filename,

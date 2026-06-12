@@ -57,12 +57,14 @@ def send_via_graph(
     subject: str,
     body: str,
     extra_headers: list[dict] | None = None,
+    sender_email: str | None = None,
+    reply_to_email: str | None = None,
 ) -> tuple[bool, str]:
     """Send a plain-text email via Microsoft Graph sendMail."""
     try:
-        sender_email = os.getenv("SENDER_EMAIL", "")
-        if not sender_email:
-            return False, "Missing SENDER_EMAIL in .env"
+        resolved_sender_email = (sender_email or os.getenv("SENDER_EMAIL", "")).strip()
+        if not resolved_sender_email:
+            return False, "Missing sender_email. Configure campaign sender_email or SENDER_EMAIL in .env"
 
         message = {
             "subject": subject,
@@ -78,11 +80,20 @@ def send_via_graph(
                 }
             ],
         }
+        resolved_reply_to = (reply_to_email or resolved_sender_email).strip()
+        if resolved_reply_to:
+            message["replyTo"] = [
+                {
+                    "emailAddress": {
+                        "address": resolved_reply_to,
+                    }
+                }
+            ]
         if extra_headers:
             message["internetMessageHeaders"] = extra_headers
 
         response = requests.post(
-            f"https://graph.microsoft.com/v1.0/users/{sender_email}/sendMail",
+            f"https://graph.microsoft.com/v1.0/users/{resolved_sender_email}/sendMail",
             headers={
                 "Authorization": f"Bearer {get_graph_token()}",
                 "Content-Type": "application/json",

@@ -93,8 +93,9 @@ class PipelineOrchestrator:
                     )
                 )
             except Exception as exc:
+                error_message = str(exc) or repr(exc) or "Unknown pipeline error"
                 run.status = RunStatus.FAILED
-                run.error = str(exc)
+                run.error = error_message
                 run.completed_at = datetime.utcnow()
                 self._save_run(run)
                 self._broadcast(
@@ -102,7 +103,7 @@ class PipelineOrchestrator:
                         EventType.PIPELINE_FAILED,
                         "Orchestrator",
                         run.id,
-                        error=str(exc),
+                        error=error_message,
                     )
                 )
                 self.logger.exception("Pipeline failed")

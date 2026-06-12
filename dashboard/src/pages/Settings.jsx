@@ -1,22 +1,41 @@
-import { useState } from "react"
-import api from "../api"
+import { useEffect, useState } from "react"
+import { useSaveSettings, useSettings, useTestSettingsEmail } from "../queries"
 
 const DAYS = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
 
 export default function Settings() {
+  const { data: settings } = useSettings()
+  const saveSettings = useSaveSettings()
+  const testSettingsEmail = useTestSettingsEmail()
   const [form, setForm] = useState({
-    azure_tenant_id: "", azure_client_id: "",
-    azure_client_secret: "", sender_email: "",
-    openai_api_key: "", openai_model: "gpt-4o-mini",
-    zoominfo_enabled: false, zoominfo_client_id: "", zoominfo_private_key: "",
+    sender_email: "",
+    openai_model: "gpt-4o-mini",
+    zoominfo_enabled: false,
     max_emails_per_day: 150, send_delay_seconds: 3,
     send_days: ["Mon","Tue","Wed","Thu"],
     send_window_start: "08:00", send_window_end: "16:00",
   })
-  const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
-  const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState(null)
+  const configured = {
+    azure_configured: Boolean(settings?.azure_configured),
+    openai_configured: Boolean(settings?.openai_configured),
+    zoominfo_configured: Boolean(settings?.zoominfo_configured),
+  }
+  const saving = saveSettings.isPending
+  const testing = testSettingsEmail.isPending
+
+  useEffect(() => {
+    if (!settings) return
+    setForm((current) => ({
+      ...current,
+      sender_email: settings.sender_email || "",
+      openai_model: settings.openai_model || "gpt-4o-mini",
+      zoominfo_enabled: Boolean(settings.zoominfo_enabled),
+      max_emails_per_day: settings.max_emails_per_day ?? current.max_emails_per_day,
+      send_delay_seconds: settings.send_delay_seconds ?? current.send_delay_seconds,
+    }))
+  }, [settings])
 
   const toggleDay = (d) => setForm(f => ({
     ...f,
@@ -24,29 +43,37 @@ export default function Settings() {
   }))
 
   const handleSave = async () => {
-    setSaving(true); setSaved(false)
+    setSaved(false)
     try {
-      await api.post("/settings", form)
+      await saveSettings.mutateAsync(form)
       setSaved(true)
       setTimeout(() => setSaved(false), 3000)
     } catch { /* fallback */ }
-    finally { setSaving(false) }
   }
 
   const handleTest = async () => {
-    setTesting(true); setTestResult(null)
+    setTestResult(null)
     try {
-      await api.post("/settings/test-email")
+      await testSettingsEmail.mutateAsync()
       setTestResult("ok")
     } catch {
       setTestResult("err")
-    } finally { setTesting(false) }
+    }
   }
 
   const F = (key) => ({
     value: form[key],
     onChange: e => setForm(f => ({ ...f, [key]: e.target.value }))
   })
+
+  const StatusRow = ({ label, configured }) => (
+    <div className="settings-status-row">
+      <span>{label}</span>
+      <strong className={configured ? "ok" : "missing"}>
+        {configured ? "Configured ✓" : "Missing ✗ (set in backend .env)"}
+      </strong>
+    </div>
+  )
 
   return (
     <>
@@ -65,18 +92,7 @@ export default function Settings() {
             <div className="card">
               <div className="card-head"><h2>Microsoft Graph — email sending</h2></div>
               <div className="card-body">
-                <div className="form-group">
-                  <div className="form-label">Tenant ID</div>
-                  <input className="form-input" type="password" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" {...F("azure_tenant_id")} />
-                </div>
-                <div className="form-group">
-                  <div className="form-label">Client ID</div>
-                  <input className="form-input" type="password" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" {...F("azure_client_id")} />
-                </div>
-                <div className="form-group">
-                  <div className="form-label">Client secret</div>
-                  <input className="form-input" type="password" placeholder="Client secret value" {...F("azure_client_secret")} />
-                </div>
+                <StatusRow label="Azure credentials" configured={configured.azure_configured} />
                 <div className="form-group">
                   <div className="form-label">Sender email</div>
                   <input className="form-input" placeholder="you@royalcyber.com" {...F("sender_email")} />
@@ -95,10 +111,7 @@ export default function Settings() {
             <div className="card">
               <div className="card-head"><h2>OpenAI</h2></div>
               <div className="card-body">
-                <div className="form-group">
-                  <div className="form-label">API key</div>
-                  <input className="form-input" type="password" placeholder="sk-proj-..." {...F("openai_api_key")} />
-                </div>
+                <StatusRow label="OpenAI credentials" configured={configured.openai_configured} />
                 <div className="form-group">
                   <div className="form-label">Model</div>
                   <select className="form-input" {...F("openai_model")}>
@@ -119,18 +132,7 @@ export default function Settings() {
                     <option value="zoominfo">ZoomInfo API</option>
                   </select>
                 </div>
-                {form.zoominfo_enabled && (
-                  <>
-                    <div className="form-group">
-                      <div className="form-label">ZoomInfo client ID</div>
-                      <input className="form-input" {...F("zoominfo_client_id")} />
-                    </div>
-                    <div className="form-group">
-                      <div className="form-label">ZoomInfo private key</div>
-                      <input className="form-input" type="password" {...F("zoominfo_private_key")} />
-                    </div>
-                  </>
-                )}
+                <StatusRow label="ZoomInfo credentials" configured={configured.zoominfo_configured} />
               </div>
             </div>
           </div>

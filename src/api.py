@@ -121,8 +121,14 @@ app.include_router(settings.router)
 
 @app.websocket("/ws/runs/{run_id}")
 async def websocket_run_events(websocket: WebSocket, run_id: str) -> None:
+    api_key = (websocket.query_params.get("api_key") or "").strip()
+    if not validate_api_key_value(api_key):
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
     loop = asyncio.get_running_loop()
+
 
     def handler(event: AgentEvent) -> None:
         if event.run_id != run_id:

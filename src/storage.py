@@ -577,6 +577,10 @@ class CampaignRepo:
         "tone",
         "max_email_words",
         "max_linkedin_chars",
+        "sender_name",
+        "sender_title",
+        "sender_email",
+        "reply_to_email",
         "email_goal",
         "key_pain_points",
     }
@@ -1025,9 +1029,10 @@ class OutreachRepository:
                 INSERT OR REPLACE INTO outreach_drafts (
                     id, lead_id, campaign_filename, touch_number, subject,
                     body, linkedin_message, status, scheduled_for, sent_at,
-                    error_message, created_at, updated_at
+                    error_message, research_summary, kb_sources, risk_flags,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     draft.id,
@@ -1041,6 +1046,9 @@ class OutreachRepository:
                     _dt_to_text(draft.scheduled_for),
                     _dt_to_text(draft.sent_at),
                     draft.error_message,
+                    draft.research_summary,
+                    draft.kb_sources,
+                    draft.risk_flags,
                     _dt_to_text(draft.created_at),
                     _dt_to_text(draft.updated_at),
                 ),
@@ -1114,6 +1122,7 @@ class OutreachRepository:
                 d.id AS draft_id, d.lead_id, d.campaign_filename,
                 d.touch_number, d.subject, d.body, d.linkedin_message,
                 d.status, d.scheduled_for, d.sent_at, d.error_message,
+                d.research_summary, d.kb_sources, d.risk_flags,
                 d.created_at, d.updated_at,
                 l.run_id, l.full_name, l.company, l.title, l.email,
                 l.location
@@ -1140,6 +1149,9 @@ class OutreachRepository:
             "scheduled_for",
             "sent_at",
             "error_message",
+            "research_summary",
+            "kb_sources",
+            "risk_flags",
         }
         updates = {
             key: value
@@ -1689,6 +1701,9 @@ class OutreachRepository:
             scheduled_for=_text_to_dt(row["scheduled_for"]),
             sent_at=_text_to_dt(row["sent_at"]),
             error_message=row["error_message"] or "",
+            research_summary=row["research_summary"] or "",
+            kb_sources=row["kb_sources"] or "[]",
+            risk_flags=row["risk_flags"] or "[]",
             created_at=_text_to_dt(row["created_at"]) or datetime.utcnow(),
             updated_at=_text_to_dt(row["updated_at"]) or datetime.utcnow(),
         )
@@ -1729,6 +1744,9 @@ class LeadRepository:
                 lead.company_linkedin_url,
                 lead.email,
                 lead.email_confidence,
+                getattr(lead, "email_verification_status", "") or "",
+                getattr(lead, "email_verification_reason", "") or "",
+                getattr(lead, "email_verification_checked_at", "") or "",
                 lead.phone,
                 getattr(lead, "duplicate_of_lead_id", "") or "",
                 lead.intent_score,
@@ -1745,11 +1763,13 @@ class LeadRepository:
                 INSERT OR REPLACE INTO leads (
                     id, run_id, full_name, first_name, last_name,
                     title, company, company_domain, location, linkedin_url,
-                    company_linkedin_url, email, email_confidence, phone,
+                    company_linkedin_url, email, email_confidence,
+                    email_verification_status, email_verification_reason,
+                    email_verification_checked_at, phone,
                     duplicate_of_lead_id,
                     intent_score, segment, status, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -1996,6 +2016,111 @@ class LeadRepository:
             query_params,
         ).fetchall()
         return [self._row_to_lead(row) for row in rows], total
+
+
+    def search_campaign_page(
+        self,
+        campaign_filename: str,
+        q: str = "",
+        segment: str = "",
+        sequence_status: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        run_ids = _campaign_run_ids(self.db.conn(), campaign_filename)
+        if not run_ids:
+            return [], 0
+
+        placeholders = ",".join("?" for _ in run_ids)
+        where = [f"l.run_id IN ({placeholders})"]
+        params: list = list(run_ids)
+
+        q = (q or "").strip()
+        if q:
+            like = f"%{q}%"
+            where.append(
+                """
+                (
+                    l.full_name LIKE ?
+                    OR l.company LIKE ?
+                    OR l.title LIKE ?
+                    OR l.email LIKE ?
+                    OR l.phone LIKE ?
+                    OR l.location LIKE ?
+                )
+                """
+            )
+            params.extend([like, like, like, like, like, like])
+
+        normalized_segment = (segment or "").strip().upper().replace("-", "_")
+        if normalized_segment in {"NEEDS_ENRICHMENT", "NO_EMAIL"}:
+            where.append(
+                "(COALESCE(l.email, '') = '' OR COALESCE(l.segment, '') = 'NO_EMAIL')"
+            )
+        elif normalized_segment in {"WITH_EMAIL", "HAS_EMAIL"}:
+            where.append("COALESCE(l.email, '') != ''")
+        elif normalized_segment:
+            where.append("COALESCE(l.segment, '') = ?")
+            params.append(normalized_segment)
+
+        normalized_sequence_status = (
+            (sequence_status or "").strip().lower().replace("-", "_")
+        )
+        if normalized_sequence_status:
+            where.append("LOWER(COALESCE(l.email_sequence_status, '')) = ?")
+            params.append(normalized_sequence_status)
+
+        where_sql = " AND ".join(where)
+        conn = self.db.conn()
+
+        total_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM leads l
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        total = int(total_row["total"] or 0) if total_row else 0
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                l.*,
+                (
+                    SELECT a.created_at
+                    FROM lead_activities a
+                    WHERE a.lead_id = l.id
+                      AND a.campaign_filename = ?
+                    ORDER BY a.created_at DESC
+                    LIMIT 1
+                ) AS last_activity_at,
+                (
+                    SELECT a.title
+                    FROM lead_activities a
+                    WHERE a.lead_id = l.id
+                      AND a.campaign_filename = ?
+                    ORDER BY a.created_at DESC
+                    LIMIT 1
+                ) AS last_activity_title
+            FROM leads l
+            WHERE {where_sql}
+            ORDER BY l.full_name COLLATE NOCASE ASC, l.created_at ASC
+            LIMIT ? OFFSET ?
+            """,
+            [
+                campaign_filename,
+                campaign_filename,
+                *params,
+                int(limit),
+                int(offset),
+            ],
+        ).fetchall()
+
+        return [dict(row) for row in rows], total
+
+
+
 
     def find_sendable(
         self,
@@ -2422,6 +2547,108 @@ class LeadRepository:
             "updated": len(updated_leads),
         }
 
+
+    def set_email_verification(
+        self,
+        lead_id: str,
+        status: str,
+        reason: str = "",
+        checked_at: str = "",
+    ) -> bool:
+        normalized_status = (status or "").strip().lower()
+        if normalized_status not in {"", "valid", "risky", "invalid"}:
+            normalized_status = ""
+
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE leads
+                SET email_verification_status = ?,
+                    email_verification_reason = ?,
+                    email_verification_checked_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized_status,
+                    reason or "",
+                    checked_at or _dt_to_text(datetime.utcnow()),
+                    _dt_to_text(datetime.utcnow()),
+                    lead_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def set_email_verification_by_email(
+        self,
+        email: str,
+        status: str,
+        reason: str = "",
+        checked_at: str = "",
+    ) -> int:
+        normalized_email = (email or "").strip().lower()
+        if not normalized_email:
+            return 0
+
+        normalized_status = (status or "").strip().lower()
+        if normalized_status not in {"", "valid", "risky", "invalid"}:
+            normalized_status = ""
+
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE leads
+                SET email_verification_status = ?,
+                    email_verification_reason = ?,
+                    email_verification_checked_at = ?,
+                    updated_at = ?
+                WHERE LOWER(email) = ?
+                """,
+                (
+                    normalized_status,
+                    reason or "",
+                    checked_at or _dt_to_text(datetime.utcnow()),
+                    _dt_to_text(datetime.utcnow()),
+                    normalized_email,
+                ),
+            )
+            return cur.rowcount
+
+    def leads_for_email_verification(
+        self,
+        campaign_filename: str,
+        only_missing: bool = True,
+        limit: int = 5000,
+    ) -> list[Lead]:
+        run_ids = _campaign_run_ids(self.db.conn(), campaign_filename)
+        if not run_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in run_ids)
+        where = [
+            f"run_id IN ({placeholders})",
+            "COALESCE(email, '') != ''",
+        ]
+        params: list = list(run_ids)
+
+        if only_missing:
+            where.append("COALESCE(email_verification_status, '') = ''")
+
+        rows = self.db.conn().execute(
+            f"""
+            SELECT *
+            FROM leads
+            WHERE {" AND ".join(where)}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            [*params, max(1, min(int(limit or 5000), 20000))],
+        ).fetchall()
+
+        return [self._row_to_lead(row) for row in rows]
+
+
+
     def _row_to_lead(self, row: sqlite3.Row) -> Lead:
         lead = Lead(
             id=row["id"],
@@ -2436,7 +2663,23 @@ class LeadRepository:
             company_linkedin_url=row["company_linkedin_url"] or "",
             email=row["email"] or "",
             email_confidence=row["email_confidence"] or "",
+            email_verification_status=(
+                row["email_verification_status"]
+                if "email_verification_status" in row.keys()
+                else ""
+            ) or "",
+            email_verification_reason=(
+                row["email_verification_reason"]
+                if "email_verification_reason" in row.keys()
+                else ""
+            ) or "",
+            email_verification_checked_at=(
+                row["email_verification_checked_at"]
+                if "email_verification_checked_at" in row.keys()
+                else ""
+            ) or "",
             phone=row["phone"] or "",
+
             intent_score=row["intent_score"] or 0.0,
             segment=Segment(row["segment"]),
             status=LeadStatus(row["status"]),
@@ -2453,6 +2696,9 @@ class LeadRepository:
             "personalised_at": None,
             "email_sequence_status": "not_started",
             "duplicate_of_lead_id": "",
+            "email_verification_status": "",
+            "email_verification_reason": "",
+            "email_verification_checked_at": "",
         }
         row_keys = set(row.keys())
         for field, default in optional_fields.items():

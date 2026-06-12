@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react"
+import { useState } from "react"
 import { useNavigate } from "react-router-dom"
 import {
-  createCampaign,
-  getCampaignOverview,
-  getCampaigns,
-  getKnowledgeBases,
-  uploadKnowledgeBase,
-} from "../api"
+  useCampaignOverview,
+  useCampaigns,
+  useCreateCampaign,
+  useKnowledgeBases,
+  useUploadKnowledgeBase,
+} from "../queries"
 
 const emptyStats = {
   total_leads: 0,
@@ -26,11 +26,59 @@ const statItems = [
   ["followups_due", "Due"],
 ]
 
+function CampaignCard({ campaign, onOpen }) {
+  const { data: stats = emptyStats } = useCampaignOverview(campaign.filename)
+
+  return (
+    <button
+      type="button"
+      className="campaign-card"
+      onClick={onOpen}
+    >
+      <div className="campaign-card-head">
+        <div>
+          <h2>{campaign.name}</h2>
+          <p>{campaign.description || "Campaign workspace"}</p>
+        </div>
+        <span className="badge completed">Active</span>
+      </div>
+
+      <div className="campaign-stat-grid">
+        {statItems.map(([key, label]) => (
+          <div className="campaign-stat" key={key}>
+            <strong>{stats[key] ?? 0}</strong>
+            <span>{label}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="campaign-kbs">
+        {(campaign.knowledge_bases || []).length > 0 ? (
+          (campaign.knowledge_bases || []).map(kb => (
+            <span className="chip" key={kb}>
+              <i className="ti ti-file-text" aria-hidden="true" />
+              {kb}
+            </span>
+          ))
+        ) : (
+          <span className="campaign-muted">No KB files linked</span>
+        )}
+      </div>
+
+      <div className="campaign-card-footer">
+        <span>Open workspace</span>
+        <i className="ti ti-arrow-right" aria-hidden="true" />
+      </div>
+    </button>
+  )
+}
+
 export default function Campaigns() {
   const navigate = useNavigate()
-  const [campaigns, setCampaigns] = useState([])
-  const [campaignStats, setCampaignStats] = useState({})
-  const [kbFiles, setKbFiles] = useState([])
+  const { data: campaigns = [] } = useCampaigns()
+  const { data: kbFiles = [] } = useKnowledgeBases()
+  const createCampaignMutation = useCreateCampaign()
+  const uploadKnowledgeBaseMutation = useUploadKnowledgeBase()
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState({
     name: "",
@@ -43,31 +91,10 @@ export default function Campaigns() {
     max_linkedin_chars: 280,
     knowledge_bases: [],
   })
-  const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
-  const [uploadingKb, setUploadingKb] = useState(false)
   const [uploadKbResult, setUploadKbResult] = useState(null)
-
-  const loadCampaigns = () => {
-    getCampaigns()
-      .then(async r => {
-        setCampaigns(r.data)
-        const pairs = await Promise.all(
-          r.data.map(c =>
-            getCampaignOverview(c.filename)
-              .then(res => [c.filename, res.data])
-              .catch(() => [c.filename, emptyStats])
-          )
-        )
-        setCampaignStats(Object.fromEntries(pairs))
-      })
-      .catch(() => {})
-  }
-
-  useEffect(() => {
-    loadCampaigns()
-    getKnowledgeBases().then(r => setKbFiles(r.data)).catch(() => {})
-  }, [])
+  const saving = createCampaignMutation.isPending
+  const uploadingKb = uploadKnowledgeBaseMutation.isPending
 
   const toggleKb = (filename) => {
     setForm(f => ({
@@ -95,18 +122,15 @@ export default function Campaigns() {
   const handleKbUpload = async (e) => {
     const file = e.target.files?.[0]
     if (!file) return
-    setUploadingKb(true)
     setUploadKbResult(null)
     try {
-      const res = await uploadKnowledgeBase(file)
+      const res = await uploadKnowledgeBaseMutation.mutateAsync(file)
       setUploadKbResult({ success: true, msg: res.data.message })
-      getKnowledgeBases().then(r => setKbFiles(r.data)).catch(() => {})
     } catch (err) {
       setUploadKbResult({
         error: err.response?.data?.detail || err.message || "Upload failed",
       })
     } finally {
-      setUploadingKb(false)
       e.target.value = ""
     }
   }
@@ -120,10 +144,9 @@ export default function Campaigns() {
       setError("Select at least one knowledge base")
       return
     }
-    setSaving(true)
     setError("")
     try {
-      await createCampaign({
+      await createCampaignMutation.mutateAsync({
         ...form,
         target_personas: form.target_personas
           .split(",").map(s => s.trim()).filter(Boolean),
@@ -132,11 +155,8 @@ export default function Campaigns() {
       })
       setShowCreate(false)
       resetForm()
-      loadCampaigns()
     } catch (err) {
       setError(err.response?.data?.detail || "Failed to save campaign")
-    } finally {
-      setSaving(false)
     }
   }
 
@@ -177,52 +197,13 @@ export default function Campaigns() {
 
       <div className="page-content">
         <div className="campaign-grid">
-          {campaigns.map(c => {
-            const stats = campaignStats[c.filename] || emptyStats
-            return (
-              <button
-                type="button"
-                className="campaign-card"
-                key={c.filename}
-                onClick={() => navigate(`/campaigns/${encodeURIComponent(c.filename)}`)}
-              >
-                <div className="campaign-card-head">
-                  <div>
-                    <h2>{c.name}</h2>
-                    <p>{c.description || "Campaign workspace"}</p>
-                  </div>
-                  <span className="badge completed">Active</span>
-                </div>
-
-                <div className="campaign-stat-grid">
-                  {statItems.map(([key, label]) => (
-                    <div className="campaign-stat" key={key}>
-                      <strong>{stats[key] ?? 0}</strong>
-                      <span>{label}</span>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="campaign-kbs">
-                  {(c.knowledge_bases || []).length > 0 ? (
-                    (c.knowledge_bases || []).map(kb => (
-                      <span className="chip" key={kb}>
-                        <i className="ti ti-file-text" aria-hidden="true" />
-                        {kb}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="campaign-muted">No KB files linked</span>
-                  )}
-                </div>
-
-                <div className="campaign-card-footer">
-                  <span>Open workspace</span>
-                  <i className="ti ti-arrow-right" aria-hidden="true" />
-                </div>
-              </button>
-            )
-          })}
+          {campaigns.map(c => (
+            <CampaignCard
+              campaign={c}
+              key={c.filename}
+              onOpen={() => navigate(`/campaigns/${encodeURIComponent(c.filename)}`)}
+            />
+          ))}
           {campaigns.length === 0 && (
             <div className="card" style={{ gridColumn: "1/-1" }}>
               <div className="card-body" style={{ textAlign: "center", color: "var(--color-text-secondary)" }}>

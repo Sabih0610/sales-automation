@@ -51,5 +51,9 @@ class CampaignConfig:
     tone: str = "professional"
     max_email_words: int = 150
     max_linkedin_chars: int = 280
+    sender_name: str = ""
+    sender_title: str = ""
+    sender_email: str = ""
+    reply_to_email: str = ""
     email_goal: str = "book a 20-minute discovery call"
     key_pain_points: list[str] = field(default_factory=list)

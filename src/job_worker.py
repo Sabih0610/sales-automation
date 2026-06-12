@@ -128,6 +128,14 @@ def _run_send_selected_drafts(job: dict, stop_event: threading.Event) -> None:
                 )
                 processed.add(remaining_id)
             break
+        has_remaining = any(
+            remaining_id not in processed
+            for remaining_id in draft_ids[index + 1:]
+        )
+        if item.get("status") == "sent" and has_remaining:
+            from src.send_policy import next_send_delay_seconds
+
+            stop_event.wait(next_send_delay_seconds())
 
 
 def _run_generate_campaign_drafts(job: dict, stop_event: threading.Event) -> None:

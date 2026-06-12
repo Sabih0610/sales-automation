@@ -45,6 +45,9 @@ class Lead:
     company_linkedin_url: str = ""
     email: str = ""
     email_confidence: str = ""
+    email_verification_status: str = ""
+    email_verification_reason: str = ""
+    email_verification_checked_at: str = ""
     phone: str = ""
     intent_score: float = 0.0
     segment: Segment = Segment.NO_EMAIL
@@ -249,6 +252,9 @@ class OutreachDraft:
     scheduled_for: Optional[datetime] = None
     sent_at: Optional[datetime] = None
     error_message: str = ""
+    research_summary: str = ""
+    kb_sources: str = "[]"
+    risk_flags: str = "[]"
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 

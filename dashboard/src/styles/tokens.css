@@ -1,0 +1,46 @@
+:root {
+  --color-background-primary: #FFFFFF;
+  --color-background-secondary: #F7FAFC;
+  --color-background-tertiary: #F2F3F5;
+  --color-text-primary: #1A202C;
+  --color-text-secondary: #5A6675;
+  --color-text-tertiary: #98A2B3;
+  --color-border-primary: #B8C0CC;
+  --color-border-secondary: #D4DAE3;
+  --color-border-tertiary: #E5E9F0;
+  --purple: #534AB7;
+  --purple-light: #EEEDFE;
+  --purple-mid: #AFA9EC;
+  --blue: #185FA5;
+  --blue-light: #E6F1FB;
+  --green: #27500A;
+  --green-light: #EAF3DE;
+  --amber: #633806;
+  --amber-light: #FAEEDA;
+  --red: #791F1F;
+  --red-light: #FCEBEB;
+  --radius: 8px;
+  --radius-lg: 12px;
+}
+
+:root[data-theme="dark"] {
+  --color-background-primary: #141517;
+  --color-background-secondary: #1C1D21;
+  --color-background-tertiary: #0F0F10;
+  --color-text-primary: #F2F4F7;
+  --color-text-secondary: #A7B0BC;
+  --color-text-tertiary: #6C7686;
+  --color-border-primary: #3A3E46;
+  --color-border-secondary: #2F3338;
+  --color-border-tertiary: #2A2D33;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: "Inter Variable", system-ui, sans-serif;
+  background: var(--color-background-tertiary);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+}
