@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 from collections import defaultdict
 from datetime import datetime
@@ -13,23 +14,22 @@ from src.storage import (
 
 
 logger = logging.getLogger(__name__)
-ACTIVE_JOB_STATUSES = {"queued", "running"}
 
 
 def _utcnow_iso() -> str:
     return datetime.utcnow().isoformat()
 
 
+def _bulk_send_rate_per_minute() -> int:
+    try:
+        configured = int(os.getenv("BULK_SEND_RATE_PER_MINUTE", "30") or 30)
+    except ValueError:
+        configured = 20
+    return max(1, min(configured, 30))
+
+
 def _has_active_campaign_job(job_type: str, campaign_filename: str) -> bool:
-    for job in job_repo.list_recent(50):
-        if job.get("type") != job_type:
-            continue
-        if job.get("status") not in ACTIVE_JOB_STATUSES:
-            continue
-        payload = job.get("payload") or {}
-        if payload.get("campaign_filename") == campaign_filename:
-            return True
-    return False
+    return job_repo.has_active_campaign_job(job_type, campaign_filename)
 
 
 def _missing_draft_groups(due_items: list[dict]) -> dict[int, list[str]]:
@@ -53,10 +53,14 @@ def run_scheduler_tick() -> None:
             continue
 
         due_items = outreach_repo.due_items(campaign_filename, None, None)
-        if not due_items:
+        due_scheduled_drafts = outreach_repo.list_due_scheduled_drafts(
+            campaign_filename,
+            limit=_bulk_send_rate_per_minute(),
+        )
+        if not due_items and not due_scheduled_drafts:
             continue
 
-        if not _has_active_campaign_job("generate_drafts", campaign_filename):
+        if due_items and not _has_active_campaign_job("generate_drafts", campaign_filename):
             for touch_number, lead_ids in _missing_draft_groups(due_items).items():
                 job_repo.create(
                     "generate_drafts",
@@ -74,6 +78,27 @@ def run_scheduler_tick() -> None:
                     touch_number,
                     len(lead_ids),
                 )
+
+        if due_scheduled_drafts and not _has_active_campaign_job(
+            "send_drafts",
+            campaign_filename,
+        ):
+            draft_ids = [draft.id for draft in due_scheduled_drafts]
+            job_repo.create(
+                "send_drafts",
+                {
+                    "campaign_filename": campaign_filename,
+                    "draft_ids": draft_ids,
+                    "rate_per_minute": _bulk_send_rate_per_minute(),
+                },
+                total=len(draft_ids),
+            )
+            logger.info(
+                "Scheduler queued send_drafts for %s (%s due scheduled drafts)",
+                campaign_filename,
+                len(draft_ids),
+            )
+            continue
 
         rules = campaign_sequence_repo.get_rules(campaign_filename)
         if not rules or rules.mode != "auto":

@@ -94,7 +94,7 @@ def calculate_next_touch_due_at(
         _get_attr(rules, "send_window_end", "17:00"),
         time(17, 0),
     )
-    skip_weekends = bool(_get_attr(rules, "skip_weekends", True))
+    skip_weekends = bool(_get_attr(rules, "skip_weekends", False))
 
     if delay_unit == "minutes":
         due += timedelta(minutes=delay_value)

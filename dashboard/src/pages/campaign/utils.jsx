@@ -1,17 +1,25 @@
 export const tabs = [
   ["overview", "Overview"],
-  ["sources", "Sources"],
   ["leads", "Leads"],
+  ["sequences", "Sequences"],
   ["drafts", "Drafts"],
-  ["queue", "Queue"],
-  ["sequence", "Sequence"],
   ["reports", "Reports"],
-  ["activity", "Activity"],
   ["settings", "Settings"],
 ]
 
+export const tabAliases = {
+  source: "leads",
+  sources: "leads",
+  queue: "drafts",
+  activity: "overview",
+  sequence: "sequences",
+  sequences: "sequences",
+  report: "reports",
+}
+
 export const tabLabels = Object.fromEntries(tabs)
 export const tabSlugs = Object.fromEntries(tabs.map(([slug, label]) => [label, slug]))
+
 
 export const defaultQueue = {
   due_today: [],
@@ -64,7 +72,7 @@ export const defaultRules = {
   stop_on_bounce: true,
   stop_on_unsubscribe: true,
   skip_no_email: true,
-  skip_weekends: true,
+  skip_weekends: false,
   send_window_start: "09:00",
   send_window_end: "17:00",
   daily_send_limit: 50,

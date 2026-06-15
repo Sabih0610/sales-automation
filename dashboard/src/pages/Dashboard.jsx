@@ -77,7 +77,7 @@ export default function Dashboard() {
           <div className="activity-list">
             {summary.recent_activities.length === 0 && (
               <div className="empty-state">
-                No activity yet — start a run from a campaign's Sources tab.
+                No activity yet — open a campaign and add leads.
               </div>
             )}
             {summary.recent_activities.map((activity, index) => (

@@ -29,8 +29,24 @@ export async function downloadFile(path, filename) {
 
 export const friendlyMessage = (err) => err.response?.data?.detail || err.message
 
+
+export const startBulkScrape = (body) =>
+  client.post("/api/bulk-scrape/start", body)
+export const getBulkScrapeJobs = (limit = 20) =>
+  client.get("/api/bulk-scrape", { params: { limit } })
+export const getBulkScrapeJob = (jobId) =>
+  client.get(`/api/bulk-scrape/${encodeURIComponent(jobId)}`)
+export const pauseBulkScrapeJob = (jobId) =>
+  client.post(`/api/bulk-scrape/${encodeURIComponent(jobId)}/pause`)
+export const resumeBulkScrapeJob = (jobId) =>
+  client.post(`/api/bulk-scrape/${encodeURIComponent(jobId)}/resume`)
+export const cancelBulkScrapeJob = (jobId) =>
+  client.post(`/api/bulk-scrape/${encodeURIComponent(jobId)}/cancel`)
+
 export const getDashboardSummary = () => client.get("/api/dashboard/summary")
 export const getRun = (id) => client.get(`/api/runs/${id}`)
+export const stopRun = (id) => client.post(`/api/runs/${id}/stop`)
+export const deleteRun = (id) => client.delete(`/api/runs/${id}`)
 export const startRun = (body) => client.post("/api/runs/start", body)
 export const getRunLeads = (id, params) => client.get(`/api/runs/${id}/leads`, { params })
 export const getRunEvents = (id) => client.get(`/api/runs/${id}/events`)
@@ -75,6 +91,23 @@ export const sendSelectedDrafts = (draftIdsOrBody) =>
     "/api/drafts/send-selected",
     Array.isArray(draftIdsOrBody) ? { draft_ids: draftIdsOrBody } : draftIdsOrBody,
   )
+export const scheduleApprovedDrafts = (filename, draftIdsOrBody = {}) =>
+  client.post(
+    `/api/campaigns/${encodeURIComponent(filename)}/drafts/schedule-approved`,
+    Array.isArray(draftIdsOrBody) ? { draft_ids: draftIdsOrBody } : draftIdsOrBody,
+  )
+export const scheduleSendDrafts = (filename, body = {}) =>
+  client.post(
+    `/api/campaigns/${encodeURIComponent(filename)}/drafts/schedule-send`,
+    body,
+  )
+export const approveScheduleDrafts = (filename, body = {}) =>
+  client.post(
+    `/api/campaigns/${encodeURIComponent(filename)}/drafts/approve-schedule`,
+    body,
+  )
+export const deleteDraft = (draftId) =>
+  client.delete(`/api/drafts/${encodeURIComponent(draftId)}`)
 export const sendDraftTest = (draftId, testEmailOrBody) =>
   client.post(
     `/api/drafts/${draftId}/send-test`,
@@ -149,6 +182,9 @@ export const getSendPolicyStatus = () => client.get("/api/send-policy/status")
 
 export const updateCampaign = (filename, data) =>
   client.patch(`/api/campaigns/${encodeURIComponent(filename)}`, data)
+
+export const deleteCampaign = (filename) =>
+  client.delete(`/api/campaigns/${encodeURIComponent(filename)}`)
 
 export const createCampaign = (data) =>
   client.post("/api/campaigns", data)

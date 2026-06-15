@@ -148,6 +148,14 @@ export const useJobs = (limit = 20) =>
   useQuery({
     queryKey: ["jobs", limit],
     queryFn: () => unwrap(api.getJobs(limit)),
+    refetchInterval: (query) => {
+      const jobs = query.state.data || []
+      return jobs.some((job) =>
+        ["queued", "running"].includes(String(job.status || "").toLowerCase()),
+      )
+        ? 2000
+        : false
+    },
   })
 
 export const useCreateCampaign = () => {
@@ -155,6 +163,20 @@ export const useCreateCampaign = () => {
   return useMutation({
     mutationFn: api.createCampaign,
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["campaigns"] })
+      qc.invalidateQueries({ queryKey: ["dashboard"] })
+    },
+  })
+}
+
+
+export const useDeleteCampaign = () => {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: api.deleteCampaign,
+    onSuccess: (_data, filename) => {
+      qc.removeQueries({ queryKey: ["campaign", filename] })
       qc.invalidateQueries({ queryKey: ["campaigns"] })
       qc.invalidateQueries({ queryKey: ["dashboard"] })
     },
@@ -169,11 +191,80 @@ export const useUploadKnowledgeBase = () => {
   })
 }
 
+
+export const useBulkScrapeJobs = (limit = 20) =>
+  useQuery({
+    queryKey: ["bulk-scrape", limit],
+    queryFn: () => unwrap(api.getBulkScrapeJobs(limit)),
+    refetchInterval: (query) => {
+      const jobs = query.state.data || []
+      return jobs.some((job) => ["queued", "running"].includes(job.status)) ? 3000 : 15000
+    },
+  })
+
+export const useStartBulkScrape = (filename = "") => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.startBulkScrape,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["bulk-scrape"] })
+      invalidateCampaign(qc, filename)
+    },
+  })
+}
+
+export const usePauseBulkScrapeJob = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.pauseBulkScrapeJob,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["bulk-scrape"] }),
+  })
+}
+
+export const useResumeBulkScrapeJob = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.resumeBulkScrapeJob,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["bulk-scrape"] }),
+  })
+}
+
+export const useCancelBulkScrapeJob = () => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.cancelBulkScrapeJob,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["bulk-scrape"] }),
+  })
+}
+
 export const useStartRun = () => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: api.startRun,
     onSuccess: () => invalidateRun(qc),
+  })
+}
+
+export const useStopRun = (filename = "") => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.stopRun,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["campaign", filename, "runs"] })
+      qc.invalidateQueries({ queryKey: ["bulk-scrape"] })
+      invalidateCampaign(qc, filename)
+    },
+  })
+}
+
+export const useDeleteRun = (filename = "") => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.deleteRun,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["campaign", filename, "runs"] })
+      invalidateCampaign(qc, filename)
+    },
   })
 }
 
@@ -260,6 +351,38 @@ export const useSendSelected = (filename) => {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: api.sendSelectedDrafts,
+    onSuccess: () => invalidateCampaign(qc, filename),
+  })
+}
+
+export const useScheduleApprovedDrafts = (filename) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (draftIdsOrBody) => api.scheduleApprovedDrafts(filename, draftIdsOrBody),
+    onSuccess: () => invalidateCampaign(qc, filename),
+  })
+}
+
+export const useScheduleSendDrafts = (filename) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body) => api.scheduleSendDrafts(filename, body),
+    onSuccess: () => invalidateCampaign(qc, filename),
+  })
+}
+
+export const useApproveScheduleDrafts = (filename) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body) => api.approveScheduleDrafts(filename, body),
+    onSuccess: () => invalidateCampaign(qc, filename),
+  })
+}
+
+export const useDeleteDraft = (filename) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: api.deleteDraft,
     onSuccess: () => invalidateCampaign(qc, filename),
   })
 }

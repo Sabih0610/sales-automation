@@ -1,9 +1,72 @@
+from pydantic import BaseModel, Field
 from fastapi import APIRouter
 
 from src.api_helpers import *
+from src.bulk_scrape_manager import bulk_scrape_manager
 
 
 router = APIRouter()
+
+
+class BulkScrapeStartRequest(BaseModel):
+    start_url: str = Field(..., min_length=1)
+    campaign_key: str = ""
+    target_leads: int = Field(default=1000, ge=1)
+    batch_max_leads: int = Field(default=1000, ge=1, le=5000)
+    batch_page_limit: int = Field(default=25, ge=1, le=250)
+
+
+@router.post("/api/bulk-scrape/start")
+def start_bulk_scrape(request: BulkScrapeStartRequest) -> dict:
+    try:
+        return bulk_scrape_manager.start(
+            orchestrator,
+            start_url=request.start_url,
+            campaign_key=request.campaign_key,
+            target_leads=request.target_leads,
+            batch_max_leads=request.batch_max_leads,
+            batch_page_limit=request.batch_page_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/bulk-scrape")
+def list_bulk_scrape_jobs(limit: int = Query(default=20, ge=1, le=100)) -> list[dict]:
+    return bulk_scrape_manager.list_recent(limit=limit)
+
+
+@router.get("/api/bulk-scrape/{job_id}")
+def get_bulk_scrape_job(job_id: str) -> dict:
+    job = bulk_scrape_manager.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Bulk scrape job not found")
+    return job
+
+
+@router.post("/api/bulk-scrape/{job_id}/pause")
+def pause_bulk_scrape_job(job_id: str) -> dict:
+    try:
+        return bulk_scrape_manager.pause(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/api/bulk-scrape/{job_id}/resume")
+def resume_bulk_scrape_job(job_id: str) -> dict:
+    try:
+        return bulk_scrape_manager.resume(orchestrator, job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/api/bulk-scrape/{job_id}/cancel")
+def cancel_bulk_scrape_job(job_id: str) -> dict:
+    try:
+        return bulk_scrape_manager.cancel(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
 
 
 @router.post("/api/runs/start", response_model=RunResponse)
@@ -19,6 +82,74 @@ def start_pipeline(request: StartPipelineRequest) -> RunResponse:
 @router.get("/api/runs", response_model=list[RunResponse])
 def list_runs() -> list[RunResponse]:
     return [_run_response(run) for run in run_repo.list_all()]
+
+
+@router.post("/api/runs/{run_id}/resume", response_model=RunResponse)
+def resume_pipeline_run(run_id: str) -> RunResponse:
+    try:
+        run = orchestrator.resume_pipeline(run_id)
+    except RuntimeError as exc:
+        message = str(exc)
+        if message == "Run not found":
+            raise HTTPException(status_code=404, detail=message) from exc
+        raise HTTPException(status_code=409, detail=message) from exc
+
+    run_repo.save(run)
+    return _run_response(run)
+
+
+@router.post("/api/runs/{run_id}/stop", response_model=RunResponse)
+def stop_pipeline_run(run_id: str) -> RunResponse:
+    run = run_repo.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # If this child run belongs to a parent bulk scrape job, cancel the parent too.
+    # Otherwise the parent will create another child run after this one stops.
+    bulk_job_id = ""
+    try:
+        filters = run.filters or {}
+        if isinstance(filters, dict):
+            bulk_job_id = filters.get("bulk_scrape_job_id") or ""
+    except Exception:
+        bulk_job_id = ""
+
+    if not bulk_job_id:
+        try:
+            bulk_job = bulk_scrape_manager.find_job_by_child_run_id(run_id)
+            bulk_job_id = bulk_job["id"] if bulk_job else ""
+        except Exception:
+            bulk_job_id = ""
+
+    if bulk_job_id:
+        try:
+            bulk_scrape_manager.cancel(bulk_job_id)
+        except Exception:
+            pass
+
+    if run.status.value == "RUNNING":
+        run_repo.request_control(run_id, "stop")
+        run.error = "Stop requested by user. Scraper will stop at the next safe checkpoint."
+        run_repo.save(run)
+
+    refreshed = run_repo.get(run_id)
+    return _run_response(refreshed or run)
+
+
+@router.delete("/api/runs/{run_id}")
+def delete_pipeline_run(run_id: str) -> dict:
+    run = run_repo.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status.value == "RUNNING":
+        raise HTTPException(
+            status_code=409,
+            detail="Stop the run before deleting it.",
+        )
+
+    deleted = run_repo.delete_run(run_id)
+    return {"deleted": bool(deleted), "run_id": run_id}
 
 @router.get("/api/runs/{run_id}", response_model=RunResponse)
 def get_run(run_id: str) -> RunResponse:

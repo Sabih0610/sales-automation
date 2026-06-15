@@ -72,17 +72,17 @@ class WriterAgent:
         template_block = ""
         if self.touch1_template:
             template_block = f"""
-CAMPAIGN EMAIL TEMPLATE:
-Subject template:
+SEQUENCE AI DIRECTION:
+Subject direction:
 {self.touch1_template.get("subject_template", "")}
 
-Email body template:
+AI writing instructions:
 {self.touch1_template.get("email_body_template", "")}
 
-LinkedIn message template:
+LinkedIn direction:
 {self.touch1_template.get("linkedin_message_template", "")}
 
-Template rules:
+Direction rules:
 - Personalise using lead/company context.
 - Keep the structure close to the template.
 - Do not invent false company facts.
@@ -114,15 +114,28 @@ CAMPAIGN PAIN POINTS TO ADDRESS:
 
 TASK:
 Write personalised outreach for this specific lead.
-Connect Royal Cyber's capabilities to THEIR specific business context.
-Do not write generic messages. Reference something specific about them.
-Follow the campaign template structure and intent when a template is provided.
-Do not invent false company facts. If research is weak, use scraped title/company context only.
+Do not copy the campaign template directly. Treat it as strategy and structure only.
+Make paragraph 1 specific to the lead's title, seniority, likely responsibility, company, and available research.
+Do not use weak generic hooks like "I noticed your role at COMPANY" unless paired with a role-specific reason.
+Connect Royal Cyber's capabilities to THEIR likely business context.
+
+Role-personalisation rules:
+- Reliability, operations, infrastructure, platform roles: focus on uptime, resilience, continuity, migration risk, integration reliability.
+- Engineering and technology leaders: focus on integration complexity, platform modernization, delivery speed, technical debt, engineering bandwidth.
+- Data, analytics, BI roles: focus on data silos, governed analytics, reporting speed, real-time insight, data quality.
+- Marketing, lifecycle, growth, customer roles: focus on customer data, segmentation, campaign operations, journey visibility.
+- Procurement, sourcing, vendor roles: focus on vendor consolidation, cost control, implementation risk, measurable outcomes.
+- Executive roles: focus on business impact, modernization ROI, operational efficiency, risk reduction.
+
+Follow the campaign template intent when a template is provided.
+Do not invent false company facts, fake news, fake initiatives, or fake personal details.
+If research is weak, personalize using title, company, industry clues, location, and campaign KB only.
+Do not include "Best,", "Regards,", sender names, signatures, or placeholders like {{sender_name}}. The application appends the signature separately.
 
 Return ONLY valid JSON with this exact structure:
 {{
   "email_subject": "subject line under 10 words",
-  "email_body": "3 short paragraphs, max {self.campaign.max_email_words} words total. Paragraph 1: specific hook about them. Paragraph 2: how Royal Cyber solves their specific challenge. Paragraph 3: clear CTA.",
+  "email_body": "3 short paragraphs, max {self.campaign.max_email_words} words total. Paragraph 1: specific hook about them. Paragraph 2: how Royal Cyber solves their specific challenge. Paragraph 3: clear CTA. Do not include greetings placeholders, sign-offs, signatures, sender names, or unresolved template variables.",
   "linkedin_message": "under {self.campaign.max_linkedin_chars} characters. Conversational. Reference something specific about them.",
   "research_summary": "1 sentence: what you found about this lead that shaped the message"
 }}

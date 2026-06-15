@@ -1,105 +1,124 @@
-import { Link } from "react-router-dom"
-import { useCampaignActivities, useCampaignOverview, useCampaignRuns } from "../../queries"
-import ActivityTimeline from "./components/ActivityTimeline.jsx"
-import PipelineBar from "./components/PipelineBar.jsx"
-import StatusPill from "./components/StatusPill.jsx"
-import { EmptyRow, emptyOverview } from "./utils.jsx"
+import { useCampaignOverview, useCampaignQueue } from "../../queries"
+import { defaultQueue, emptyOverview } from "./utils.jsx"
 
-const runPath = (filename, runId) =>
-  `/campaigns/${encodeURIComponent(filename)}/runs/${encodeURIComponent(runId)}`
-
-function RunLink({ filename, run }) {
-  const label = run.label || `Run ${run.id.slice(0, 8)}`
-  return (
-    <Link className="run-link" to={runPath(filename, run.id)}>
-      <span>{label}</span>
-      <span className="run-id-muted">{run.id.slice(0, 8)}</span>
-    </Link>
-  )
+function activeQueueItems(queue) {
+  if (Array.isArray(queue.items)) return queue.items
+  return [
+    ...(queue.due_today || []),
+    ...(queue.scheduled || []),
+    ...(queue.waiting || []),
+  ]
 }
 
-function ActivityMini({ activities }) {
-  return (
-    <div className="card">
-      <div className="card-head"><h2>Recent activity</h2></div>
-      <ActivityTimeline activities={activities} compact />
-    </div>
-  )
+function sendingStatusSummary(queueData, overview) {
+  const queue = { ...defaultQueue, ...(queueData || {}) }
+  const items = activeQueueItems(queue)
+  const statusCount = (values) =>
+    items.filter((item) =>
+      values.includes(String(item.status || item.draft_status || "").toLowerCase()),
+    ).length
+
+  return {
+    scheduled:
+      (queue.due_today?.length || 0) +
+      (queue.waiting?.length || 0) +
+      Math.max(queue.scheduled?.length || 0, overview.scheduled || 0) +
+      statusCount(["queued", "pending"]),
+    sending: statusCount(["sending", "running", "in_progress"]),
+    failed: (queue.failed?.length || 0) + statusCount(["failed", "error"]),
+  }
 }
 
 export default function OverviewTab({ filename, onSelectTab }) {
   const { data: overviewData = emptyOverview } = useCampaignOverview(filename)
-  const { data: runs = [] } = useCampaignRuns(filename)
-  const { data: activities = [] } = useCampaignActivities(filename, { limit: 100 })
+  const { data: queueData = defaultQueue } = useCampaignQueue(filename)
   const overview = { ...emptyOverview, ...overviewData }
-  const leadCollection = overview.lead_collection || emptyOverview.lead_collection
-  const cards = [
-    ["total_leads", "Total leads", "ti-users", "leads"],
-    ["with_email", "With email", "ti-at", "leads"],
-    ["needs_enrichment", "Needs enrichment", "ti-database-search", "leads"],
-    ["drafts_generated", "Drafts generated", "ti-mail-edit", "drafts"],
-    ["approved_drafts", "Approved", "ti-circle-check", "drafts"],
-    ["emails_sent", "Emails sent", "ti-send", "queue"],
-    ["followups_due", "Follow-ups due", "ti-clock", "queue"],
-    ["replies", "Replies", "ti-message-reply", "activity"],
+  const sendingStats = sendingStatusSummary(queueData, overview)
+
+  const detailCards = [
+    {
+      icon: "ti-mail-edit",
+      label: "Drafts generated",
+      tab: "drafts",
+      value: overview.drafts_generated ?? 0,
+    },
+    {
+      icon: "ti-message-reply",
+      label: "Replies",
+      tab: "reports",
+      value: overview.replies ?? 0,
+    },
+    {
+      icon: "ti-alert-circle",
+      label: "Bounces",
+      tab: "reports",
+      value: overview.bounces ?? 0,
+    },
+    {
+      icon: "ti-user-off",
+      label: "Unsubscribes",
+      tab: "reports",
+      value: overview.unsubscribed ?? 0,
+    },
   ]
 
   return (
     <>
-      <div className="metric-grid">
-        {cards.map(([key, label, icon, tab]) => (
-          <button className="metric-card" key={key} onClick={() => onSelectTab(tab)}>
-            <span className="metric-icon"><i className={`ti ${icon}`} aria-hidden="true" /></span>
-            <strong>{overview[key] ?? 0}</strong>
-            <span>{label}</span>
-          </button>
-        ))}
-      </div>
-
-      <div className="card">
-        <div className="card-head"><h2>Pipeline</h2></div>
-        <div className="card-body">
-          <PipelineBar overview={overview} />
-        </div>
-      </div>
-
-      <div className="workspace-two-col">
-        <div className="card">
-          <div className="card-head"><h2>Recent source runs</h2></div>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Run</th>
-                  <th>Source type</th>
-                  <th>Status</th>
-                  <th>Scraped</th>
-                  <th>Unique</th>
-                  <th>Duplicates</th>
-                  <th>Stop reason</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {runs.length === 0 && <EmptyRow colSpan={8} text="No campaign runs yet." />}
-                {runs.slice(0, 8).map((run) => (
-                  <tr key={run.id}>
-                    <td><RunLink filename={filename} run={run} /></td>
-                    <td>Sales Navigator</td>
-                    <td><StatusPill value={run.status} /></td>
-                    <td>{run.total_scraped || 0}</td>
-                    <td>{leadCollection.unique_leads || "-"}</td>
-                    <td>{leadCollection.duplicates_removed || "-"}</td>
-                    <td>{run.stop_reason || "-"}</td>
-                    <td><Link className="btn xs" to={runPath(filename, run.id)}>View logs</Link></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      <div className="overview-command-grid">
+        <div className="card overview-command-card">
+          <div className="card-head">
+            <h2>Next actions</h2>
+          </div>
+          <div className="overview-cta-row">
+            <button className="btn primary" onClick={() => onSelectTab("leads")} type="button">
+              <i className="ti ti-user-plus" aria-hidden="true" />
+              Add leads
+            </button>
+            <button className="btn" onClick={() => onSelectTab("leads")} type="button">
+              <i className="ti ti-sparkles" aria-hidden="true" />
+              Generate drafts
+            </button>
+            <button className="btn" onClick={() => onSelectTab("drafts")} type="button">
+              <i className="ti ti-mail-check" aria-hidden="true" />
+              Review drafts
+            </button>
+            <button className="btn" onClick={() => onSelectTab("drafts")} type="button">
+              <i className="ti ti-calendar-check" aria-hidden="true" />
+              Approve &amp; Schedule
+            </button>
           </div>
         </div>
 
-        <ActivityMini activities={activities.slice(0, 10)} />
+        <div className="card overview-queue-card">
+          <div className="card-head">
+            <h2>Sending status</h2>
+            <button className="btn sm" onClick={() => onSelectTab("drafts")} type="button">
+              Open Drafts
+            </button>
+          </div>
+          <div className="overview-queue-stats">
+            {[
+              ["Scheduled", sendingStats.scheduled],
+              ["Sending", sendingStats.sending],
+              ["Failed", sendingStats.failed],
+            ].map(([label, value]) => (
+              <div className="overview-queue-stat" key={label}>
+                <strong>{value}</strong>
+                <span>{label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="metric-grid">
+        {detailCards.map(({ icon, label, tab, value }) => (
+          <button className="metric-card" key={label} onClick={() => onSelectTab(tab)}>
+            <span className="metric-icon"><i className={`ti ${icon}`} aria-hidden="true" /></span>
+            <strong>{value}</strong>
+            <span>{label}</span>
+          </button>
+        ))}
       </div>
     </>
   )

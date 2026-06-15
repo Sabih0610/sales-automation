@@ -13,3 +13,5 @@ dashboard/node_modules/
 dashboard/dist/
 *.log
 dashboard/*smoke*.png
+backups/
+bulk_scrape_inspect.txt

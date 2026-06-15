@@ -1,9 +1,13 @@
+import json
+import csv
+import io
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
 from src.api_helpers import *
 from src.email_verify import verify_email
+from src.models import EnrichmentMode, Lead, LeadStatus, PipelineRun, RunStatus, Segment
 
 
 router = APIRouter()
@@ -228,6 +232,30 @@ def _campaign_report_data(campaign_filename: str, days: int = 30) -> dict:
         }:
             status_breakdown["active"] += total
 
+    draft_status_rows = conn.execute(
+        """
+        SELECT status, COUNT(*) AS total
+        FROM outreach_drafts
+        WHERE campaign_filename = ?
+        GROUP BY status
+        """,
+        (campaign_filename,),
+    ).fetchall()
+
+    draft_status_breakdown = {
+        "draft": 0,
+        "approved": 0,
+        "scheduled": 0,
+        "sending": 0,
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+    }
+
+    for row in draft_status_rows:
+        status = row["status"] or "unknown"
+        draft_status_breakdown[status] = int(row["total"] or 0)
+
     total_sent = sum(item["sent"] for item in per_touch)
     total_replies = sum(item["replies_attributed"] for item in per_touch)
     activity_bounces = sum(item["bounces"] for item in per_touch)
@@ -241,6 +269,12 @@ def _campaign_report_data(campaign_filename: str, days: int = 30) -> dict:
         "per_touch": per_touch,
         "totals": {
             "sent": total_sent,
+            "drafts": draft_status_breakdown.get("draft", 0)
+            + draft_status_breakdown.get("approved", 0),
+            "scheduled": draft_status_breakdown.get("scheduled", 0),
+            "sending": draft_status_breakdown.get("sending", 0),
+            "failed": draft_status_breakdown.get("failed", 0),
+            "skipped": draft_status_breakdown.get("skipped", 0),
             "replies": total_replies,
             "bounces": total_bounces,
             "unsubscribes": total_unsubscribes,
@@ -249,6 +283,7 @@ def _campaign_report_data(campaign_filename: str, days: int = 30) -> dict:
         },
         "daily": daily,
         "status_breakdown": status_breakdown,
+        "draft_status_breakdown": draft_status_breakdown,
     }
 
 
@@ -617,6 +652,165 @@ def _add_reconciliation_diff(
             }
         )
 
+
+async def _read_enriched_rows(file: UploadFile) -> list[dict]:
+    contents = await file.read()
+    filename = (file.filename or "").lower()
+
+    if filename.endswith(".xlsx"):
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="openpyxl not installed. Run: pip install openpyxl",
+            ) from exc
+
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(contents),
+            read_only=True,
+            data_only=True,
+        )
+        sheet = workbook.active
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            return []
+
+        headers = [str(cell or "").strip() for cell in rows[0]]
+        parsed = []
+        for values in rows[1:]:
+            parsed.append({
+                headers[idx]: "" if value is None else str(value).strip()
+                for idx, value in enumerate(values)
+                if idx < len(headers) and headers[idx]
+            })
+        return parsed
+
+    if filename.endswith(".csv") or not filename:
+        text = contents.decode("utf-8-sig", errors="ignore")
+        return list(csv.DictReader(io.StringIO(text)))
+
+    raise HTTPException(
+        status_code=400,
+        detail="Only .csv and .xlsx files are supported",
+    )
+
+
+def _uploaded_row_to_lead(row: dict) -> Lead | None:
+    email = _row_value(
+        row,
+        "Email",
+        "Work Email",
+        "Business Email",
+        "Email Address",
+        "email",
+    )
+    full_name = _row_value(row, "Full Name", "Name", "full_name")
+    first_name = _row_value(row, "First Name", "first_name")
+    last_name = _row_value(row, "Last Name", "last_name")
+
+    if not full_name:
+        full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+
+    if not first_name and full_name:
+        parts = full_name.split()
+        first_name = parts[0] if parts else ""
+        last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    company = _row_value(
+        row,
+        "Company Name",
+        "Company",
+        "Account Name",
+        "company",
+    )
+    title = _row_value(row, "Job Title", "Title", "title")
+    phone = _row_value(
+        row,
+        "Phone",
+        "Direct Phone",
+        "Mobile Phone",
+        "Cell",
+        "Phone Number",
+        "phone",
+    )
+    domain = _row_value(
+        row,
+        "Company Domain",
+        "Domain",
+        "Website",
+        "Company Website",
+        "company_domain",
+    )
+    linkedin_url = _norm_url(
+        _row_value(
+            row,
+            "LinkedIn URL",
+            "Person LinkedIn URL",
+            "linkedin_url",
+        )
+    )
+    company_linkedin_url = _norm_url(
+        _row_value(
+            row,
+            "Company LinkedIn URL",
+            "company_linkedin_url",
+        )
+    )
+    location = _split_location(row)
+
+    if domain:
+        import re
+        domain = re.sub(
+            r"https?://(www\.)?",
+            "",
+            domain,
+            flags=re.IGNORECASE,
+        ).rstrip("/")
+
+    # Require at least one useful identity field.
+    if not any([email, linkedin_url, full_name, company]):
+        return None
+
+    return Lead(
+        full_name=full_name,
+        first_name=first_name,
+        last_name=last_name,
+        title=title,
+        company=company,
+        company_domain=domain,
+        location=location,
+        linkedin_url=linkedin_url,
+        company_linkedin_url=company_linkedin_url,
+        email=email,
+        email_confidence="uploaded" if email else "",
+        phone=phone,
+        segment=Segment.WARM if email else Segment.NO_EMAIL,
+        status=LeadStatus.ENRICHED if email else LeadStatus.SCRAPED,
+    )
+
+
+def _index_reconciliation_lead(
+    lead: Lead,
+    by_id,
+    by_linkedin,
+    by_email,
+    by_name_company,
+    by_first_last_company,
+) -> None:
+    by_id[lead.id] = lead
+    if lead.linkedin_url:
+        by_linkedin[_norm_url(lead.linkedin_url)].append(lead)
+    if lead.email:
+        by_email[lead.email.strip().lower()].append(lead)
+    if lead.full_name and lead.company:
+        by_name_company[_norm_name_company(lead.full_name, lead.company)].append(lead)
+    if lead.first_name and lead.last_name and lead.company:
+        by_first_last_company[
+            _norm_name_company(f"{lead.first_name} {lead.last_name}", lead.company)
+        ].append(lead)
+
+
         
 @router.post("/api/campaigns/{campaign_filename}/upload-enriched")
 async def upload_campaign_enriched(
@@ -689,7 +883,29 @@ async def upload_campaign_enriched(
     unchanged = 0
     unmatched = 0
     ambiguous = 0
+    created = 0
+    created_with_email = 0
     affected_runs: set[str] = set()
+    manual_upload_run = None
+
+    def ensure_manual_upload_run() -> PipelineRun:
+        nonlocal manual_upload_run
+        if manual_upload_run:
+            return manual_upload_run
+
+        manual_upload_run = PipelineRun(
+            status=RunStatus.RUNNING,
+            filters={
+                "campaign": campaign_filename,
+                "campaign_key": campaign_filename,
+                "source": "manual_upload",
+                "upload_filename": file.filename or "",
+            },
+            enrichment_mode=EnrichmentMode.FREE,
+            started_at=datetime.utcnow(),
+        )
+        run_repo.save(manual_upload_run)
+        return manual_upload_run
 
     for idx, row in enumerate(rows, start=2):
         row_label = _reconciliation_row_label(row, idx)
@@ -822,12 +1038,76 @@ async def upload_campaign_enriched(
                 continue
 
         if not lead:
-            unmatched += 1
-            report["unmatched"].append(
+            new_lead = _uploaded_row_to_lead(row)
+            if not new_lead:
+                unmatched += 1
+                report["unmatched"].append(
+                    {
+                        "row": idx,
+                        "label": row_label,
+                        "reason": "no_matching_lead_or_required_identity_fields",
+                        "input": row,
+                    }
+                )
+                continue
+
+            upload_run = ensure_manual_upload_run()
+            lead_repo.save_batch(upload_run.id, [new_lead])
+            affected_runs.add(upload_run.id)
+            created += 1
+            if new_lead.email:
+                created_with_email += 1
+
+            verification = verify_email(new_lead.email) if new_lead.email else None
+            if verification:
+                lead_repo.set_email_verification(
+                    new_lead.id,
+                    verification["status"],
+                    verification["reason"],
+                    verification["checked_at"],
+                )
+
+            state = outreach_repo.get_or_create_state(
+                new_lead.id,
+                campaign_filename,
+            )
+            state.status = "enriched" if new_lead.email else "not_started"
+            outreach_repo.upsert_state(state)
+            _set_lead_sequence_columns(new_lead.id, state.status)
+
+            lead_repo.mark_duplicate_if_any(new_lead.id, campaign_filename)
+            refreshed = lead_repo.get_by_id(new_lead.id) or new_lead
+
+            _add_activity(
+                refreshed,
+                campaign_filename,
+                "lead_imported",
+                "Lead imported from uploaded file",
+                "This lead was created from a campaign upload.",
+                {
+                    "row": idx,
+                    "source": "manual_upload",
+                    "email_verification": verification,
+                },
+            )
+
+            _index_reconciliation_lead(
+                refreshed,
+                by_id,
+                by_linkedin,
+                by_email,
+                by_name_company,
+                by_first_last_company,
+            )
+
+            report["updated"].append(
                 {
                     "row": idx,
                     "label": row_label,
-                    "reason": "no_matching_lead",
+                    "lead": _reconciliation_candidate_payload(refreshed),
+                    "match_method": "created_from_upload",
+                    "diffs": [],
+                    "email_verification": verification,
                     "input": row,
                 }
             )
@@ -1050,6 +1330,15 @@ async def upload_campaign_enriched(
                 }
             )
 
+    if manual_upload_run:
+        manual_upload_run.status = RunStatus.COMPLETED
+        manual_upload_run.total_scraped = created
+        manual_upload_run.total_enriched = created_with_email
+        manual_upload_run.total_warm = created_with_email
+        manual_upload_run.total_no_email = max(0, created - created_with_email)
+        manual_upload_run.completed_at = datetime.utcnow()
+        run_repo.save(manual_upload_run)
+
     _update_segments_for_runs({run_id for run_id in affected_runs if run_id})
 
     errors = [
@@ -1065,14 +1354,94 @@ async def upload_campaign_enriched(
         "unchanged": unchanged,
         "unmatched": unmatched,
         "ambiguous": ambiguous,
+        "created": created,
         "errors": errors,
         "report": report,
         "message": (
-            "No matching leads found. Make sure the file includes Lead ID, LinkedIn URL, or Full Name + Company."
-            if matched == 0 and total_rows > 0
-            else "Enriched leads uploaded successfully"
+            "No usable leads found. Make sure the file includes Email, LinkedIn URL, Full Name, or Company."
+            if matched == 0 and created == 0 and total_rows > 0
+            else f"Upload processed successfully. Created {created}, updated {updated}."
         ),
     }
+
+
+@router.post("/api/campaigns/{campaign_filename}/verify-emails")
+def verify_campaign_emails(
+    campaign_filename: str,
+    only_missing: bool = Query(True),
+    limit: int = Query(500, ge=1, le=5000),
+) -> dict:
+    rows = _campaign_lead_rows(campaign_filename, limit=None)
+
+    checked = 0
+    skipped = 0
+    counts = {
+        "valid": 0,
+        "risky": 0,
+        "invalid": 0,
+        "missing": 0,
+    }
+    results = []
+
+    for row in rows:
+        if checked >= limit:
+            break
+
+        lead_id = str(row.get("id") or "").strip()
+        email = str(row.get("email") or "").strip()
+        current_status = str(row.get("email_verification_status") or "").strip()
+
+        if not lead_id:
+            skipped += 1
+            continue
+
+        if not email:
+            counts["missing"] += 1
+            skipped += 1
+            results.append({
+                "lead_id": lead_id,
+                "email": "",
+                "status": "missing",
+                "reason": "no_email",
+            })
+            continue
+
+        if only_missing and current_status:
+            skipped += 1
+            counts[current_status] = counts.get(current_status, 0) + 1
+            continue
+
+        verification = verify_email(email)
+        lead_repo.set_email_verification(
+            lead_id,
+            verification["status"],
+            verification["reason"],
+            verification["checked_at"],
+        )
+
+        checked += 1
+        status = verification["status"]
+        counts[status] = counts.get(status, 0) + 1
+        results.append({
+            "lead_id": lead_id,
+            "email": email,
+            "status": status,
+            "reason": verification["reason"],
+            "checked_at": verification["checked_at"],
+        })
+
+    return {
+        "success": True,
+        "campaign_filename": campaign_filename,
+        "checked": checked,
+        "skipped": skipped,
+        "counts": counts,
+        "only_missing": only_missing,
+        "limit": limit,
+        "results": results,
+        "message": f"Verified {checked} emails.",
+    }
+
 
 @router.get("/api/campaigns/{campaign_filename}/sequence-settings")
 def get_campaign_sequence_settings(campaign_filename: str) -> dict:
@@ -1111,7 +1480,13 @@ def save_campaign_sequence_settings(
     rules = request.rules.model_dump() if request.rules else {}
     _save_sequence_settings(
         campaign_filename,
-        {"touches": touches, "steps": touches, "rules": rules},
+        {
+            "name": request.name,
+            "sequence_name": request.sequence_name,
+            "touches": touches,
+            "steps": touches,
+            "rules": rules,
+        },
     )
     return {
         "saved": True,
@@ -1166,6 +1541,251 @@ def update_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     return updated
+
+
+def _campaign_filename_aliases(campaign_filename: str) -> set[str]:
+    normalized = (campaign_filename or "").strip()
+    if not normalized:
+        return set()
+    with_json = normalized if normalized.endswith(".json") else f"{normalized}.json"
+    without_json = with_json[:-5] if with_json.endswith(".json") else with_json
+    return {with_json, without_json}
+
+
+def _delete_by_ids(conn, table: str, column: str, ids: set[str]) -> int:
+    values = sorted(str(value) for value in ids if value)
+    if not values:
+        return 0
+    placeholders = ",".join("?" for _ in values)
+    cur = conn.execute(
+        f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+        values,
+    )
+    return int(cur.rowcount or 0)
+
+
+def _job_payload_campaign(payload_json: str) -> str:
+    try:
+        payload = json.loads(payload_json or "{}")
+    except Exception:
+        return ""
+    return str(
+        payload.get("campaign_filename")
+        or payload.get("campaign")
+        or payload.get("campaign_key")
+        or ""
+    ).strip()
+
+
+def _run_filters_campaign(filters_json: str) -> str:
+    try:
+        filters = json.loads(filters_json or "{}")
+    except Exception:
+        return ""
+    return str(
+        filters.get("campaign")
+        or filters.get("campaign_key")
+        or filters.get("campaign_filename")
+        or ""
+    ).strip()
+
+
+@router.delete("/api/campaigns/{campaign_filename}")
+def delete_campaign(campaign_filename: str) -> dict:
+    campaign = campaign_repo.get_by_filename(campaign_filename)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    filename = campaign["filename"]
+    aliases = _campaign_filename_aliases(filename)
+    conn = lead_repo.db.conn()
+
+    active_bulk_rows = conn.execute(
+        """
+        SELECT id
+        FROM bulk_scrape_jobs
+        WHERE campaign_key IN (?, ?)
+          AND status IN ('queued', 'running')
+        """,
+        tuple(sorted(aliases)),
+    ).fetchall()
+
+    if active_bulk_rows:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop or cancel active bulk scrape jobs before deleting this campaign.",
+        )
+
+    active_run_rows = conn.execute(
+        """
+        SELECT id, filters
+        FROM pipeline_runs
+        WHERE status = 'RUNNING'
+        """
+    ).fetchall()
+    for row in active_run_rows:
+        if _run_filters_campaign(row["filters"]) in aliases:
+            raise HTTPException(
+                status_code=409,
+                detail="Stop active scrape runs before deleting this campaign.",
+            )
+
+    active_job_rows = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM jobs
+        WHERE status IN ('queued', 'running')
+        """
+    ).fetchall()
+    for row in active_job_rows:
+        if _job_payload_campaign(row["payload_json"]) in aliases:
+            raise HTTPException(
+                status_code=409,
+                detail="Cancel active campaign jobs before deleting this campaign.",
+            )
+
+    bulk_rows = conn.execute(
+        """
+        SELECT id
+        FROM bulk_scrape_jobs
+        WHERE campaign_key IN (?, ?)
+        """,
+        tuple(sorted(aliases)),
+    ).fetchall()
+    bulk_job_ids = {row["id"] for row in bulk_rows}
+
+    run_rows = conn.execute(
+        """
+        SELECT id, filters
+        FROM pipeline_runs
+        """
+    ).fetchall()
+
+    run_ids: set[str] = set()
+    for row in run_rows:
+        try:
+            filters = json.loads(row["filters"] or "{}")
+        except Exception:
+            filters = {}
+        campaign_key = str(
+            filters.get("campaign")
+            or filters.get("campaign_key")
+            or filters.get("campaign_filename")
+            or ""
+        ).strip()
+        bulk_job_id = str(filters.get("bulk_scrape_job_id") or "").strip()
+        if campaign_key in aliases or bulk_job_id in bulk_job_ids:
+            run_ids.add(row["id"])
+
+    universe_rows = conn.execute(
+        """
+        SELECT id
+        FROM lead_universes
+        WHERE campaign_filename = ?
+        """,
+        (filename,),
+    ).fetchall()
+    universe_ids = {row["id"] for row in universe_rows}
+
+    segment_rows = conn.execute(
+        """
+        SELECT id
+        FROM lead_source_segments
+        WHERE campaign_filename = ?
+        """,
+        (filename,),
+    ).fetchall()
+    segment_ids = {row["id"] for row in segment_rows}
+
+    if universe_ids:
+        placeholders = ",".join("?" for _ in universe_ids)
+        rows = conn.execute(
+            f"""
+            SELECT id
+            FROM lead_source_segments
+            WHERE universe_id IN ({placeholders})
+            """,
+            sorted(universe_ids),
+        ).fetchall()
+        segment_ids.update(row["id"] for row in rows)
+
+    job_rows = conn.execute(
+        """
+        SELECT id, payload_json
+        FROM jobs
+        """
+    ).fetchall()
+    job_ids = {
+        row["id"]
+        for row in job_rows
+        if _job_payload_campaign(row["payload_json"]) in aliases
+    }
+
+    counts = {}
+
+    with conn:
+        counts["outreach_drafts"] = conn.execute(
+            "DELETE FROM outreach_drafts WHERE campaign_filename = ?",
+            (filename,),
+        ).rowcount
+        counts["lead_sequence_state"] = conn.execute(
+            "DELETE FROM lead_sequence_state WHERE campaign_filename = ?",
+            (filename,),
+        ).rowcount
+        counts["lead_activities"] = conn.execute(
+            "DELETE FROM lead_activities WHERE campaign_filename = ?",
+            (filename,),
+        ).rowcount
+        counts["send_log"] = conn.execute(
+            "DELETE FROM send_log WHERE campaign_filename = ?",
+            (filename,),
+        ).rowcount
+        counts["campaign_sequence_steps"] = conn.execute(
+            "DELETE FROM campaign_sequence_steps WHERE campaign_filename IN (?, ?)",
+            tuple(sorted(aliases)),
+        ).rowcount
+        counts["campaign_sequence_rules"] = conn.execute(
+            "DELETE FROM campaign_sequence_rules WHERE campaign_filename IN (?, ?)",
+            tuple(sorted(aliases)),
+        ).rowcount
+
+        counts["run_checkpoints"] = _delete_by_ids(conn, "run_checkpoints", "run_id", run_ids)
+
+        try:
+            counts["run_controls"] = _delete_by_ids(conn, "run_controls", "run_id", run_ids)
+        except Exception:
+            counts["run_controls"] = 0
+
+        counts["leads_by_run"] = _delete_by_ids(conn, "leads", "run_id", run_ids)
+        counts["leads_by_universe"] = _delete_by_ids(conn, "leads", "lead_universe_id", universe_ids)
+        counts["leads_by_segment"] = _delete_by_ids(conn, "leads", "lead_source_segment_id", segment_ids)
+
+        counts["lead_source_segments_by_id"] = _delete_by_ids(conn, "lead_source_segments", "id", segment_ids)
+        counts["lead_source_segments_by_campaign"] = conn.execute(
+            "DELETE FROM lead_source_segments WHERE campaign_filename = ?",
+            (filename,),
+        ).rowcount
+        counts["lead_universes"] = conn.execute(
+            "DELETE FROM lead_universes WHERE campaign_filename = ?",
+            (filename,),
+        ).rowcount
+
+        counts["bulk_scrape_jobs"] = _delete_by_ids(conn, "bulk_scrape_jobs", "id", bulk_job_ids)
+        counts["pipeline_runs"] = _delete_by_ids(conn, "pipeline_runs", "id", run_ids)
+        counts["jobs"] = _delete_by_ids(conn, "jobs", "id", job_ids)
+
+        counts["campaigns"] = conn.execute(
+            "DELETE FROM campaigns WHERE filename = ?",
+            (filename,),
+        ).rowcount
+
+    return {
+        "deleted": True,
+        "filename": filename,
+        "counts": counts,
+    }
+
+
 
 @router.get("/api/campaigns")
 def list_campaigns() -> list[dict]:

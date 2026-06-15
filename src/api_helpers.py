@@ -9,7 +9,7 @@ import logging
 import os
 import shutil
 import threading
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +76,12 @@ from src.sequence_modes import normalize_sequence_mode
 from src.unsubscribe import make_unsubscribe_url, parse_token
 
 
+from src.personalisation.agents.context_agent import ContextAgent
+from src.personalisation.agents.web_research_agent import WebResearchAgent
+from src.personalisation.agents.writer_agent import WriterAgent
+from src.personalisation.knowledge_base import KnowledgeBaseLoader
+from src.personalisation.models import ResearchResult
+
 logger = logging.getLogger(__name__)
 COMPANY_FOOTER_ADDRESS = (
     "Royal Cyber Inc., 55 Shuman Blvd, Suite 275, Naperville, IL 60563"
@@ -84,6 +90,7 @@ COMPANY_FOOTER_ADDRESS = (
 orchestrator = orchestrator_module.PipelineOrchestrator()
 _segment_runner_lock = threading.Lock()
 _running_segment_ids: set[str] = set()
+_running_universe_ids: set[str] = set()
 
 
 def _apply_unsubscribe_token(token: str) -> dict | None:
@@ -174,7 +181,7 @@ class SequenceRulesRequest(BaseModel):
     stop_on_bounce: bool = True
     stop_on_unsubscribe: bool = True
     skip_no_email: bool = True
-    skip_weekends: bool = True
+    skip_weekends: bool = False
     send_window_start: str = "09:00"
     send_window_end: str = "17:00"
     daily_send_limit: int = 50
@@ -184,6 +191,8 @@ class SequenceRulesRequest(BaseModel):
 
 
 class SequenceSettingsRequest(BaseModel):
+    name: str = ""
+    sequence_name: str = ""
     touches: list[SequenceTouchRequest] = []
     steps: list[SequenceTouchRequest] = []
     rules: SequenceRulesRequest | None = None
@@ -212,6 +221,24 @@ class SkipDraftRequest(BaseModel):
 
 class SendSelectedDraftsRequest(BaseModel):
     draft_ids: list[str] = []
+
+
+class ScheduleApprovedDraftsRequest(BaseModel):
+    draft_ids: list[str] = []
+    schedule_for: str = "next_allowed"
+
+
+class ScheduleSendDraftsRequest(BaseModel):
+    draft_ids: list[str] = []
+    mode: str = "send_now"
+    rate_per_minute: int = 20
+
+
+class ApproveScheduleDraftsRequest(BaseModel):
+    draft_ids: list[str] = []
+    start_mode: str = "now"
+    start_at: str = ""
+    rate_per_minute: int = 20
 
 
 class DraftSendTestRequest(BaseModel):
@@ -356,6 +383,16 @@ def _load_sequence_settings(campaign_filename: str) -> dict:
 
 def _save_sequence_settings(campaign_filename: str, settings: dict) -> None:
     touches = settings.get("touches") or settings.get("steps") or []
+    sequence_name = str(
+        settings.get("sequence_name") or settings.get("name") or ""
+    ).strip()
+    if sequence_name:
+        campaign = campaign_repo.get_by_filename(campaign_filename) or {}
+        config = {
+            **(campaign.get("config") or {}),
+            "sequence_name": sequence_name,
+        }
+        campaign_repo.update_config(campaign_filename, config)
     for item in touches:
         touch_number = int(item.get("touch_number") or item.get("number") or 0)
         if touch_number <= 0:
@@ -456,7 +493,7 @@ def _save_sequence_settings(campaign_filename: str, settings: dict) -> None:
                 rules_data.get("stop_on_unsubscribe", True)
             ),
             skip_no_email=bool(rules_data.get("skip_no_email", True)),
-            skip_weekends=bool(rules_data.get("skip_weekends", True)),
+            skip_weekends=bool(rules_data.get("skip_weekends", False)),
             send_window_start=rules_data.get("send_window_start", "09:00"),
             send_window_end=rules_data.get("send_window_end", "17:00"),
             daily_send_limit=daily_limit,
@@ -886,14 +923,36 @@ def _run_segment_now(segment_id: str) -> None:
             exporter = ExportAgent(run, segmented)
             exporter.on_event(lambda event: event_repo.save(event))
             output_files = exporter.execute()
-            run.status = RunStatus.COMPLETED
-            run.completed_at = datetime.utcnow()
-            run_repo.save(run)
-
             stop_reason = getattr(scraper, "_sales_nav_stop_reason", "unknown")
             if raw_count == 0 and stop_reason == "unknown":
                 stop_reason = "blocked_or_captcha"
-            status = "completed" if unique_count or raw_count else "exhausted"
+
+            scraper_failed = (
+                raw_count == 0
+                and stop_reason in {
+                    "blocked_or_captcha",
+                    "chrome_cdp_error",
+                    "browser_error",
+                    "content_timeout",
+                    "login_required",
+                }
+            )
+
+            if scraper_failed:
+                status = "failed"
+                run.status = RunStatus.FAILED
+                run.error = (
+                    "Scraper produced no usable leads. "
+                    f"Stop reason: {stop_reason}."
+                )
+            else:
+                status = "completed" if unique_count or raw_count else "exhausted"
+                run.status = RunStatus.COMPLETED
+                run.error = ""
+
+            run.completed_at = datetime.utcnow()
+            run_repo.save(run)
+
             lead_universe_repo.update_segment_counts(
                 segment.id,
                 raw_count,
@@ -956,51 +1015,14 @@ def _start_segment_thread(segment_id: str) -> None:
 
 
 def _run_all_segments_now(universe_id: str) -> None:
-    while True:
-        segment = lead_universe_repo.next_queued_segment(universe_id)
-        if not segment:
-            lead_universe_repo.refresh_universe_totals(universe_id)
-            return
-        _run_segment_now(segment.id)
-
-
-async def _read_enriched_rows(file: UploadFile) -> list[dict]:
-    contents = await file.read()
-    filename = (file.filename or "").lower()
-    if filename.endswith(".xlsx"):
-        try:
-            import openpyxl
-
-            workbook = openpyxl.load_workbook(
-                io.BytesIO(contents),
-                read_only=True,
-                data_only=True,
-            )
-            sheet = workbook.active
-            rows = list(sheet.iter_rows(values_only=True))
-            if not rows:
-                return []
-            headers = [str(cell or "").strip() for cell in rows[0]]
-            parsed = []
-            for values in rows[1:]:
-                parsed.append({
-                    headers[idx]: "" if value is None else str(value).strip()
-                    for idx, value in enumerate(values)
-                    if idx < len(headers) and headers[idx]
-                })
-            return parsed
-        except ImportError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail="openpyxl not installed. Run: pip install openpyxl",
-            ) from exc
-    if filename.endswith(".csv") or not filename:
-        text = contents.decode("utf-8-sig", errors="ignore")
-        return list(csv.DictReader(io.StringIO(text)))
-    raise HTTPException(
-        status_code=400,
-        detail="Only .csv and .xlsx files are supported",
-    )
+    try:
+        while True:
+            segment = lead_universe_repo.next_queued_segment(universe_id)
+            if not segment:
+                break
+            _run_segment_now(segment.id)
+    finally:
+        _running_universe_ids.discard(universe_id)
 
 
 def _update_segments_for_runs(run_ids: set[str]) -> None:
@@ -1038,6 +1060,7 @@ VALID_DRAFT_STATUSES = {
     "draft",
     "approved",
     "scheduled",
+    "sending",
     "sent",
     "failed",
     "skipped",
@@ -1190,6 +1213,17 @@ def _campaign_sender_signature(campaign_filename: str) -> str:
 
     return "\n".join(lines)
 
+def _ensure_sender_signature(body: str, campaign_filename: str) -> str:
+    signature = _campaign_sender_signature(campaign_filename).strip()
+    text = (body or "").rstrip()
+
+    if not signature:
+        return text
+
+    if signature in text:
+        return text
+
+    return f"{text}\n\n{signature}".strip()
 
 def _campaign_context(campaign_filename: str) -> dict[str, str]:
     campaign = campaign_repo.get_by_filename(campaign_filename) or {}
@@ -1495,11 +1529,68 @@ def _set_lead_sequence_columns(
     lead_repo.update_sequence_status(lead_id, status, error)
 
 
+
+
+def _block_risky_verified_emails() -> bool:
+    return (
+        os.getenv("EMAIL_VERIFICATION_BLOCK_RISKY", "false")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def _email_verification_block_reason(lead) -> str:
+    status = (
+        getattr(lead, "email_verification_status", "") or ""
+    ).strip().lower()
+
+    if status == "invalid":
+        return "invalid_email"
+
+    if status == "risky" and _block_risky_verified_emails():
+        return "risky_email"
+
+    return ""
+
+def _graph_retry_delay_minutes() -> int:
+    raw = os.getenv("GRAPH_RETRY_DELAY_MINUTES", "15")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 15
+    return max(5, min(value, 120))
+
+
+def _is_transient_graph_error(error: str) -> bool:
+    text = (error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "graph api error 429",
+            "too many requests",
+            "throttl",
+            "temporarily unavailable",
+            "timeout",
+            "timed out",
+            "connection",
+            "graph api error 500",
+            "graph api error 502",
+            "graph api error 503",
+            "graph api error 504",
+            "service unavailable",
+            "gateway",
+        )
+    )
+
 def _with_unsubscribe_footer(
     body: str,
     lead_id: str,
     email: str,
 ) -> tuple[str, str]:
+
+    if os.getenv("UNSUBSCRIBE_FOOTER_ENABLED", "false").strip().lower() != "true":
+        return body, ""
     unsubscribe_url = make_unsubscribe_url(lead_id, email)
     one_click_url = f"{unsubscribe_url}/one-click"
     if unsubscribe_url:
@@ -1529,7 +1620,224 @@ def _validate_generate_drafts_for_leads(
     )
     if not step:
         raise HTTPException(status_code=404, detail="Sequence step not found")
+
+    if not (step.subject_template or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Sequence subject direction is empty. Add a subject direction before generating drafts.",
+        )
+
+    if not (step.email_body_template or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Sequence AI writing instructions are empty. Add instructions before generating drafts.",
+        )
+
     return step
+
+
+
+def _ai_personalised_drafts_enabled() -> bool:
+    return os.getenv("AI_PERSONALISED_DRAFTS_ENABLED", "true").strip().lower() != "false"
+
+
+def _sequence_step_template_payload(step: CampaignSequenceStep) -> dict:
+    return {
+        "touch_number": step.touch_number,
+        "touch_name": step.touch_name,
+        "subject_template": step.subject_template or "",
+        "email_body_template": step.email_body_template or "",
+        "linkedin_message_template": step.linkedin_message_template or "",
+        "delay_days": step.delay_days,
+        "delay_value": step.delay_value,
+        "delay_unit": step.delay_unit,
+        "delay_type": step.delay_type,
+    }
+
+
+def _template_draft_content(
+    lead: Lead,
+    campaign_filename: str,
+    step: CampaignSequenceStep,
+    touch_number: int,
+    previous_sent: OutreachDraft | None,
+) -> dict:
+    touch1_subject = _touch1_subject(lead.id, campaign_filename)
+    template_context = {
+        "touch1_subject": touch1_subject,
+        "previous_subject": previous_sent.subject if previous_sent else "",
+        "previous_body": previous_sent.body if previous_sent else "",
+        "previous_sent_at": _dt(previous_sent.sent_at) if previous_sent else "",
+        "current_followup_goal": _followup_goal(step, touch_number),
+        **_campaign_context(campaign_filename),
+    }
+
+    subject = render_template(
+        step.subject_template,
+        lead,
+        campaign_filename,
+        template_context,
+    )
+    body = render_template(
+        step.email_body_template,
+        lead,
+        campaign_filename,
+        template_context,
+    )
+
+    if touch_number > 1 and previous_sent and not step.email_body_template.strip():
+        body = _build_followup_body(
+            lead,
+            campaign_filename,
+            previous_sent,
+            step,
+            touch_number,
+        )
+
+    if (
+        touch_number > 1
+        and previous_sent
+        and body.strip()
+        and body.strip() == previous_sent.body.strip()
+    ):
+        body = _build_followup_body(
+            lead,
+            campaign_filename,
+            previous_sent,
+            step,
+            touch_number,
+        )
+
+    body = _strip_ai_signature_artifacts(body, campaign_filename)
+    body = _ensure_sender_signature(body, campaign_filename)
+    review_updates = _draft_review_updates(
+        lead=lead,
+        campaign_filename=campaign_filename,
+        subject=subject,
+        body=body,
+        research_summary="",
+    )
+
+    return {
+        "subject": subject,
+        "body": body,
+        "linkedin_message": linkedin_message,
+        "review_updates": review_updates,
+    }
+
+
+def _combined_research_for_lead(
+    lead: Lead,
+    research_agent: WebResearchAgent,
+    research_cache: dict[str, ResearchResult],
+) -> ResearchResult:
+    domain = (getattr(lead, "company_domain", "") or "").strip().lower()
+    company = (getattr(lead, "company", "") or "").strip().lower()
+    cache_key = domain or f"company:{company}"
+
+    base_research = None
+    if domain or company:
+        base_research = research_cache.get(cache_key)
+        if base_research is None:
+            base_research = research_agent.research(lead)
+            research_cache[cache_key] = base_research
+
+    role_research = research_agent._infer_from_role(lead)
+
+    if base_research:
+        source_parts = [
+            part
+            for part in [base_research.research_source, role_research.research_source]
+            if part
+        ]
+        return ResearchResult(
+            lead_id=lead.id,
+            company_name=lead.company,
+            website_text=base_research.website_text,
+            person_context=role_research.person_context,
+            research_source="+".join(source_parts) or "combined",
+            error=base_research.error,
+        )
+
+    return role_research
+
+
+
+def _strip_ai_signature_artifacts(body: str, campaign_filename: str) -> str:
+    text = (body or "").replace("{{sender_name}}", "").strip()
+    if not text:
+        return ""
+
+    sender = _campaign_sender_identity(campaign_filename)
+    signature_names = {
+        (sender.get("sender_name") or "").strip(),
+        "Royal Cyber Team",
+        "Enterprise Solutions Team",
+    }
+    signature_names = {value for value in signature_names if value}
+
+    lines = text.splitlines()
+    cut_at = None
+
+    for index, line in enumerate(lines):
+        normalized = line.strip().lower().rstrip(",")
+        if normalized in {"best", "best regards", "regards", "thanks", "thank you"}:
+            cut_at = index
+            break
+
+    if cut_at is not None:
+        lines = lines[:cut_at]
+
+    while lines and lines[-1].strip() in signature_names:
+        lines.pop()
+
+    return "\n".join(lines).strip()
+
+
+def _ai_personalised_draft_content(
+    lead: Lead,
+    campaign_filename: str,
+    step: CampaignSequenceStep,
+    research_agent: WebResearchAgent,
+    context_agent: ContextAgent,
+    writer_agent: WriterAgent,
+    research_cache: dict[str, ResearchResult],
+) -> dict:
+    research = _combined_research_for_lead(
+        lead,
+        research_agent,
+        research_cache,
+    )
+    context = context_agent.get_context(lead, research)
+    message = writer_agent.write(lead, research, context)
+
+    if message.error:
+        raise RuntimeError(message.error)
+
+    subject = (message.email_subject or "").strip()
+    body = (message.email_body or "").strip()
+    linkedin_message = (message.linkedin_message or "").strip()
+
+    if not subject or not body:
+        raise RuntimeError("AI returned empty subject or body")
+
+    body = _ensure_sender_signature(body, campaign_filename)
+    review_updates = _draft_review_updates(
+        lead=lead,
+        campaign_filename=campaign_filename,
+        subject=subject,
+        body=body,
+        research_summary=message.research_summary,
+        kb_sources=message.kb_files_used,
+    )
+
+    return {
+        "subject": subject,
+        "body": body,
+        "linkedin_message": linkedin_message,
+        "review_updates": review_updates,
+    }
+
 
 
 def _generate_drafts_for_leads(
@@ -1543,6 +1851,23 @@ def _generate_drafts_for_leads(
     generated = 0
     skipped = 0
     skips = []
+
+    ai_enabled = _ai_personalised_drafts_enabled()
+    research_cache: dict[str, ResearchResult] = {}
+
+    campaign_config = None
+    research_agent = None
+    context_agent = None
+    writer_agent = None
+
+    if ai_enabled:
+        campaign_config = KnowledgeBaseLoader.load_campaign(campaign_filename)
+        research_agent = WebResearchAgent()
+        context_agent = ContextAgent(campaign_config)
+        writer_agent = WriterAgent(
+            campaign_config,
+            touch1_template=_sequence_step_template_payload(step),
+        )
 
     for lead_id in lead_ids:
         lead = lead_repo.get_by_id(lead_id)
@@ -1604,60 +1929,55 @@ def _generate_drafts_for_leads(
             skips.append({"lead_id": lead.id, "reason": "duplicate_draft"})
             continue
 
-        touch1_subject = _touch1_subject(lead.id, campaign_filename)
         previous_sent = _previous_sent_draft(
             lead.id,
             campaign_filename,
             touch_number,
         )
-        template_context = {
-            "touch1_subject": touch1_subject,
-            "previous_subject": previous_sent.subject if previous_sent else "",
-            "previous_body": previous_sent.body if previous_sent else "",
-            "previous_sent_at": _dt(previous_sent.sent_at) if previous_sent else "",
-            "current_followup_goal": _followup_goal(step, touch_number),
-            **_campaign_context(campaign_filename),
-        }
-        subject = render_template(
-            step.subject_template,
-            lead,
-            campaign_filename,
-            template_context,
-        )
-        body = render_template(
-            step.email_body_template,
-            lead,
-            campaign_filename,
-            template_context,
-        )
-        if touch_number > 1 and previous_sent and not step.email_body_template.strip():
-            body = _build_followup_body(
+
+        try:
+            if ai_enabled:
+                content = _ai_personalised_draft_content(
+                    lead=lead,
+                    campaign_filename=campaign_filename,
+                    step=step,
+                    research_agent=research_agent,
+                    context_agent=context_agent,
+                    writer_agent=writer_agent,
+                    research_cache=research_cache,
+                )
+            else:
+                content = _template_draft_content(
+                    lead=lead,
+                    campaign_filename=campaign_filename,
+                    step=step,
+                    touch_number=touch_number,
+                    previous_sent=previous_sent,
+                )
+        except Exception as exc:
+            skipped += 1
+            skips.append({
+                "lead_id": lead.id,
+                "reason": "ai_personalisation_failed" if ai_enabled else "template_generation_failed",
+                "error": str(exc),
+            })
+            _add_activity(
                 lead,
                 campaign_filename,
-                previous_sent,
-                step,
-                touch_number,
+                "draft_generation_failed",
+                "Draft generation failed",
+                str(exc),
+                {
+                    "touch_number": touch_number,
+                    "ai_enabled": ai_enabled,
+                },
             )
-        if (
-            touch_number > 1
-            and previous_sent
-            and body.strip()
-            and body.strip() == previous_sent.body.strip()
-        ):
-            body = _build_followup_body(
-                lead,
-                campaign_filename,
-                previous_sent,
-                step,
-                touch_number,
-            )
-        review_updates = _draft_review_updates(
-            lead=lead,
-            campaign_filename=campaign_filename,
-            subject=subject,
-            body=body,
-            research_summary="",
-        )
+            continue
+
+        subject = content["subject"]
+        body = content["body"]
+        linkedin_message = content["linkedin_message"]
+        review_updates = content["review_updates"]
 
         if existing and overwrite:
             draft = outreach_repo.update_draft(
@@ -1678,7 +1998,7 @@ def _generate_drafts_for_leads(
                 touch_number=touch_number,
                 subject=subject,
                 body=body,
-                linkedin_message="",
+                linkedin_message=linkedin_message,
                 status="draft",
                 research_summary=review_updates["research_summary"],
                 kb_sources=review_updates["kb_sources"],
@@ -1755,7 +2075,14 @@ def _parse_clock(value: str, fallback: time) -> time:
         return fallback
 
 
+def _send_window_enabled() -> bool:
+    return os.getenv("SEND_WINDOW_ENABLED", "false").strip().lower() == "true"
+
+
 def _inside_send_window(rules: CampaignSequenceRules) -> bool:
+    if not _send_window_enabled():
+        return True
+
     now_time = datetime.now().time()
     start = _parse_clock(rules.send_window_start, time(9, 0))
     end = _parse_clock(rules.send_window_end, time(17, 0))
@@ -1763,12 +2090,641 @@ def _inside_send_window(rules: CampaignSequenceRules) -> bool:
         return start <= now_time <= end
     return now_time >= start or now_time <= end
 
+def _bulk_send_rate_per_minute(value: int | None = None) -> int:
+    if value:
+        return max(1, min(int(value), 30))
+    try:
+        configured = int(os.getenv("BULK_SEND_RATE_PER_MINUTE", "30") or 30)
+    except ValueError:
+        configured = 20
+    return max(1, min(configured, 30))
+
+
+def _campaign_rule_block_message(rules: CampaignSequenceRules) -> str:
+    if not _inside_send_window(rules):
+        return (
+            "Outside campaign send window. Schedule or send during "
+            f"{rules.send_window_start}-{rules.send_window_end}."
+        )
+    return ""
+
+
+def _next_allowed_send_at(
+    rules: CampaignSequenceRules,
+    from_dt: datetime | None = None,
+) -> datetime:
+    now = (from_dt or datetime.now()).replace(second=0, microsecond=0)
+
+    if not _send_window_enabled():
+        return now
+    start = _parse_clock(rules.send_window_start, time(9, 0))
+    end = _parse_clock(rules.send_window_end, time(17, 0))
+    candidate = now
+
+    for _ in range(14):
+        window_start = datetime.combine(candidate.date(), start)
+        window_end = datetime.combine(candidate.date(), end)
+
+        if start <= end:
+            if candidate < window_start:
+                return window_start
+            if candidate <= window_end:
+                return candidate
+            candidate = datetime.combine(
+                (candidate + timedelta(days=1)).date(),
+                start,
+            )
+            continue
+
+        if candidate.time() >= start or candidate.time() <= end:
+            return candidate
+        return window_start
+
+    return datetime.combine((now + timedelta(days=1)).date(), time(9, 0))
+
+
+def _karachi_local_to_utc(value: datetime) -> datetime:
+    """Convert a UI-selected Asia/Karachi local datetime into naive UTC for DB storage."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    # Pakistan is UTC+05:00 and does not currently use daylight saving time.
+    return value - timedelta(hours=5)
+
+
+def _parse_schedule_datetime(value: str) -> datetime:
+    raw = (value or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="start_at is required when start_mode is later")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="start_at must be a valid ISO datetime",
+        ) from exc
+
+    return _karachi_local_to_utc(parsed).replace(second=0, microsecond=0)
+
+
+def _rate_limited_slots(
+    count: int,
+    start_at: datetime,
+    rate_per_minute: int,
+) -> list[datetime]:
+    start = start_at.replace(second=0, microsecond=0)
+    return [
+        start + timedelta(minutes=index // rate_per_minute)
+        for index in range(count)
+    ]
+
+
+def _throttled_send_slots(
+    count: int,
+    rules: CampaignSequenceRules,
+    start_at: datetime,
+    rate_per_minute: int,
+) -> list[datetime]:
+    slots = []
+    current = start_at.replace(second=0, microsecond=0)
+    in_current_minute = 0
+
+    for _ in range(count):
+        current = _next_allowed_send_at(rules, current)
+        slots.append(current)
+        in_current_minute += 1
+        if in_current_minute >= rate_per_minute:
+            current = current + timedelta(minutes=1)
+            in_current_minute = 0
+
+    return slots
+
 
 def _queued_job_response(job: dict) -> JSONResponse:
     return JSONResponse(
         status_code=202,
         content={"job_id": job["id"], "status": job["status"]},
     )
+
+
+def _schedule_approved_drafts(
+    campaign_filename: str,
+    request: ScheduleApprovedDraftsRequest,
+) -> dict:
+    return _schedule_send_drafts(
+        campaign_filename,
+        ScheduleSendDraftsRequest(
+            draft_ids=request.draft_ids,
+            mode="schedule",
+            rate_per_minute=_bulk_send_rate_per_minute(),
+        ),
+    )
+
+
+def _schedule_send_drafts(
+    campaign_filename: str,
+    request: ScheduleSendDraftsRequest,
+) -> dict:
+    mode = request.mode or "send_now"
+    if mode == "schedule_next_allowed":
+        mode = "schedule"
+    if mode not in {"send_now", "schedule"}:
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be send_now or schedule",
+        )
+
+    rate_per_minute = _bulk_send_rate_per_minute(request.rate_per_minute)
+    _, rules = campaign_sequence_repo.ensure_defaults(
+        campaign_filename,
+        default_steps=[],
+    )
+
+    blocked_message = _campaign_rule_block_message(rules)
+    if mode == "send_now" and blocked_message:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Sending is not available right now. "
+                f"{blocked_message}"
+            ),
+        )
+
+    requested_ids = [draft_id for draft_id in request.draft_ids if draft_id]
+    drafts = (
+        outreach_repo.get_drafts_by_ids(requested_ids)
+        if requested_ids
+        else outreach_repo.list_approved_drafts(campaign_filename)
+    )
+
+    scheduled = 0
+    skipped = 0
+    details = []
+    found_ids = {draft.id for draft in drafts}
+    eligible = []
+
+    for missing_id in set(requested_ids) - found_ids:
+        skipped += 1
+        details.append({
+            "draft_id": missing_id,
+            "status": "skipped",
+            "reason": "not_found",
+        })
+
+    for draft in drafts:
+        if draft.campaign_filename != campaign_filename:
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "wrong_campaign",
+            })
+            continue
+
+        if draft.status != "approved":
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "not_approved",
+            })
+            continue
+
+        lead = lead_repo.get_by_id(draft.lead_id)
+        if not lead:
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "lead_not_found",
+            })
+            continue
+
+        if not (lead.email or "").strip():
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "no_email",
+            })
+            continue
+
+        if (getattr(lead, "email_verification_status", "") or "").lower() == "invalid":
+            outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "failed",
+                    "error_message": (
+                        "Blocked: email verification marked this address invalid "
+                        f"({getattr(lead, 'email_verification_reason', '') or 'invalid'})."
+                    ),
+                },
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "invalid_email",
+            })
+            continue
+
+        state = outreach_repo.get_or_create_state(
+            draft.lead_id,
+            campaign_filename,
+        )
+        if _is_state_stopped(state):
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": state.status,
+            })
+            continue
+
+        if suppression_repo.is_suppressed(lead.email):
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": "suppressed"},
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "suppressed",
+            })
+            continue
+
+        eligible.append((draft, lead, state))
+
+    start_at = (
+        datetime.now().replace(second=0, microsecond=0)
+        if mode == "send_now"
+        else _next_allowed_send_at(rules)
+    )
+    slots = _throttled_send_slots(
+        len(eligible),
+        rules,
+        _next_allowed_send_at(rules, start_at),
+        rate_per_minute,
+    )
+
+    first_scheduled_for = slots[0] if slots else None
+    last_scheduled_for = slots[-1] if slots else None
+
+    for (draft, lead, state), scheduled_for in zip(eligible, slots):
+        updated = outreach_repo.update_draft(
+            draft.id,
+            {
+                "status": "scheduled",
+                "scheduled_for": scheduled_for,
+                "error_message": "",
+            },
+        )
+        if not updated:
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "update_failed",
+            })
+            continue
+
+        if not _is_state_stopped(state):
+            state.status = "scheduled"
+            state.current_touch = max(state.current_touch, draft.touch_number)
+            outreach_repo.upsert_state(state)
+
+        _add_activity(
+            lead,
+            campaign_filename,
+            "followup_scheduled" if draft.touch_number > 1 else "scheduled",
+            f"Touch {draft.touch_number} scheduled",
+            _dt(scheduled_for) or "",
+            {
+                "draft_id": draft.id,
+                "touch_number": draft.touch_number,
+                "scheduled_for": _dt(scheduled_for),
+            },
+        )
+        scheduled += 1
+        details.append({
+            "draft_id": draft.id,
+            "lead_id": draft.lead_id,
+            "status": "scheduled",
+            "scheduled_for": _dt(scheduled_for),
+        })
+
+    due_now_ids = [
+        detail["draft_id"]
+        for detail in details
+        if detail.get("status") == "scheduled"
+        and detail.get("scheduled_for")
+        and datetime.fromisoformat(detail["scheduled_for"]) <= datetime.now()
+    ][:rate_per_minute]
+    job = None
+    if due_now_ids:
+        job = job_repo.create(
+            "send_drafts",
+            {
+                "campaign_filename": campaign_filename,
+                "draft_ids": due_now_ids,
+                "rate_per_minute": rate_per_minute,
+            },
+            total=len(due_now_ids),
+        )
+
+    return {
+        "scheduled": scheduled,
+        "skipped": skipped,
+        "rate_per_minute": rate_per_minute,
+        "first_scheduled_for": _dt(first_scheduled_for),
+        "last_scheduled_for": _dt(last_scheduled_for),
+        "first_time": _dt(first_scheduled_for),
+        "last_time": _dt(last_scheduled_for),
+        "scheduled_for": _dt(first_scheduled_for),
+        "job_id": job["id"] if job else "",
+        "message": f"Scheduled {scheduled} emails at {rate_per_minute} per minute.",
+        "details": details,
+    }
+
+
+def _approve_schedule_drafts(
+    campaign_filename: str,
+    request: ApproveScheduleDraftsRequest,
+) -> dict:
+    requested_ids = list(dict.fromkeys(
+        str(draft_id).strip()
+        for draft_id in (request.draft_ids or [])
+        if str(draft_id).strip()
+    ))
+    if not requested_ids:
+        raise HTTPException(status_code=400, detail="draft_ids are required")
+
+    start_mode = (request.start_mode or "now").strip().lower()
+    if start_mode not in {"now", "later"}:
+        raise HTTPException(
+            status_code=400,
+            detail="start_mode must be now or later",
+        )
+
+    rate_per_minute = _bulk_send_rate_per_minute(request.rate_per_minute)
+    start_at = (
+        datetime.utcnow().replace(second=0, microsecond=0)
+        if start_mode == "now"
+        else _parse_schedule_datetime(request.start_at)
+    )
+
+    _, rules = campaign_sequence_repo.ensure_defaults(
+        campaign_filename,
+        default_steps=[],
+    )
+
+    drafts = outreach_repo.get_drafts_by_ids(requested_ids)
+    found_ids = {draft.id for draft in drafts}
+    scheduled = 0
+    skipped_invalid = 0
+    skipped_not_eligible = 0
+    details: list[dict] = []
+    eligible: list[tuple[OutreachDraft, Lead, LeadSequenceState, bool]] = []
+
+    for missing_id in set(requested_ids) - found_ids:
+        skipped_not_eligible += 1
+        details.append({
+            "draft_id": missing_id,
+            "status": "skipped",
+            "reason": "not_found",
+        })
+
+    for draft in drafts:
+        if draft.campaign_filename != campaign_filename:
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "wrong_campaign",
+            })
+            continue
+
+        if draft.status not in {"draft", "approved"}:
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "not_schedulable",
+                "draft_status": draft.status,
+            })
+            continue
+
+        lead = lead_repo.get_by_id(draft.lead_id)
+        if not lead:
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "lead_not_found",
+            })
+            continue
+
+        if not (lead.email or "").strip():
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "no_email",
+            })
+            continue
+
+        if (getattr(lead, "email_verification_status", "") or "").lower() == "invalid":
+            outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "failed",
+                    "error_message": (
+                        "Blocked: email verification marked this address invalid "
+                        f"({getattr(lead, 'email_verification_reason', '') or 'invalid'})."
+                    ),
+                },
+            )
+            skipped_invalid += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "invalid_email",
+            })
+            continue
+
+        if _email_verification_block_reason(lead) == "risky_email":
+            outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "failed",
+                    "error_message": (
+                        "Blocked: email verification marked this address risky "
+                        f"({getattr(lead, 'email_verification_reason', '') or 'risky'})."
+                    ),
+                },
+            )
+            skipped_invalid += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "risky_email",
+            })
+            continue
+
+        state = outreach_repo.get_or_create_state(
+            draft.lead_id,
+            campaign_filename,
+        )
+        if _is_state_stopped(state):
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": state.status,
+            })
+            continue
+
+        if suppression_repo.is_suppressed(lead.email):
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": "suppressed"},
+            )
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "suppressed",
+            })
+            continue
+
+        eligible.append((draft, lead, state, draft.status == "draft"))
+
+    slots = _rate_limited_slots(len(eligible), start_at, rate_per_minute)
+    first_scheduled_for = slots[0] if slots else None
+    last_scheduled_for = slots[-1] if slots else None
+
+    for (draft, lead, state, needs_approval), scheduled_for in zip(eligible, slots):
+        if needs_approval:
+            approved = outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "approved",
+                    "error_message": "",
+                },
+            )
+            if not approved:
+                skipped_not_eligible += 1
+                details.append({
+                    "draft_id": draft.id,
+                    "status": "skipped",
+                    "reason": "approval_failed",
+                })
+                continue
+
+        updated = outreach_repo.update_draft(
+            draft.id,
+            {
+                "status": "scheduled",
+                "scheduled_for": scheduled_for,
+                "error_message": "",
+            },
+        )
+        if not updated:
+            skipped_not_eligible += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "update_failed",
+            })
+            continue
+
+        if needs_approval:
+            _add_activity(
+                lead,
+                campaign_filename,
+                "draft_approved",
+                f"Touch {draft.touch_number} draft approved",
+                "Approved during schedule",
+                {"draft_id": draft.id},
+            )
+
+        if not _is_state_stopped(state):
+            state.status = "scheduled"
+            state.current_touch = max(state.current_touch, draft.touch_number)
+            outreach_repo.upsert_state(state)
+
+        _add_activity(
+            lead,
+            campaign_filename,
+            "followup_scheduled" if draft.touch_number > 1 else "scheduled",
+            f"Touch {draft.touch_number} scheduled",
+            _dt(scheduled_for) or "",
+            {
+                "draft_id": draft.id,
+                "touch_number": draft.touch_number,
+                "scheduled_for": _dt(scheduled_for),
+                "rate_per_minute": rate_per_minute,
+            },
+        )
+        scheduled += 1
+        details.append({
+            "draft_id": draft.id,
+            "lead_id": draft.lead_id,
+            "email": lead.email,
+            "status": "scheduled",
+            "scheduled_for": _dt(scheduled_for),
+            "touch_number": draft.touch_number,
+        })
+
+    due_now_ids = [
+        detail["draft_id"]
+        for detail in details
+        if detail.get("status") == "scheduled"
+        and detail.get("scheduled_for")
+        and datetime.fromisoformat(detail["scheduled_for"]) <= datetime.utcnow()
+    ][:rate_per_minute]
+
+    job = None
+    if due_now_ids:
+        job = job_repo.create(
+            "send_drafts",
+            {
+                "campaign_filename": campaign_filename,
+                "draft_ids": due_now_ids,
+                "rate_per_minute": rate_per_minute,
+            },
+            total=len(due_now_ids),
+        )
+
+    return {
+        "scheduled": scheduled,
+        "skipped_invalid": skipped_invalid,
+        "skipped_not_eligible": skipped_not_eligible,
+        "skipped": skipped_invalid + skipped_not_eligible,
+        "rate_per_minute": rate_per_minute,
+        "first_scheduled_for": _dt(first_scheduled_for),
+        "last_scheduled_for": _dt(last_scheduled_for),
+        "job_id": job["id"] if job else "",
+        "message": f"Scheduled {scheduled} emails. Sending will start automatically.",
+        "details": details,
+    }
 
 
 def _defer_draft_send(
@@ -1891,7 +2847,18 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
             )
             failed += 1
             continue
-        if draft.status != "approved":
+        if draft.status == "scheduled":
+            if not draft.scheduled_for or draft.scheduled_for > datetime.utcnow():
+                skipped += 1
+                details.append({
+                    "draft_id": draft.id,
+                    "lead_id": lead.id,
+                    "status": "skipped",
+                    "reason": "scheduled_not_due",
+                    "scheduled_for": _dt(draft.scheduled_for),
+                })
+                continue
+        elif draft.status != "approved":
             skipped += 1
             details.append({
                 "draft_id": draft.id,
@@ -1969,7 +2936,10 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
         )
         already_sent = outreach_repo.count_sent_today(draft.campaign_filename)
         already_sent += sent_by_campaign.get(draft.campaign_filename, 0)
-        if already_sent >= rules.daily_send_limit:
+        campaign_daily_limit_enabled = (
+            os.getenv("CAMPAIGN_DAILY_LIMIT_ENABLED", "false").strip().lower() == "true"
+        )
+        if campaign_daily_limit_enabled and already_sent >= rules.daily_send_limit:
             skipped += 1
             message = (
                 f"Daily send limit reached for this campaign "
@@ -1981,18 +2951,6 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
                 "lead_id": lead.id,
                 "status": "skipped",
                 "reason": "daily_send_limit_reached",
-                "message": message,
-            })
-            continue
-        if rules.skip_weekends and datetime.now().weekday() >= 5:
-            skipped += 1
-            message = "Weekend sending is blocked by campaign rules."
-            messages.append(message)
-            details.append({
-                "draft_id": draft.id,
-                "lead_id": lead.id,
-                "status": "skipped",
-                "reason": "weekend_send_blocked",
                 "message": message,
             })
             continue
@@ -2050,7 +3008,7 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
             )
 
             if policy_reason.startswith("Daily cap") or (
-                policy_reason == "Outside send window"
+                policy_reason == "Outside send window" and _send_window_enabled()
             ):
                 skipped += _defer_remaining_policy_drafts(
                     drafts,
@@ -2068,6 +3026,119 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
 
             time_module.sleep(next_send_delay_seconds())
 
+        claimed = outreach_repo.acquire_sendable_draft(draft.id)
+        if not claimed:
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "already_claimed_or_not_due",
+                "scheduled_for": _dt(draft.scheduled_for),
+            })
+            continue
+        draft = claimed
+
+        lead = lead_repo.get_by_id(draft.lead_id)
+        if not lead:
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": "lead_not_found"},
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "status": "skipped",
+                "reason": "lead_not_found_after_claim",
+            })
+            continue
+
+        if not lead.email:
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": "no_email"},
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": "no_email_after_claim",
+            })
+            continue
+
+        if (getattr(lead, "email_verification_status", "") or "").lower() == "invalid":
+            outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "failed",
+                    "error_message": (
+                        "Blocked before send: email verification marked this address invalid "
+                        f"({getattr(lead, 'email_verification_reason', '') or 'invalid'})."
+                    ),
+                },
+            )
+            failed += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "failed",
+                "reason": "invalid_email_after_claim",
+            })
+            continue
+
+        if _email_verification_block_reason(lead) == "risky_email":
+            outreach_repo.update_draft(
+                draft.id,
+                {
+                    "status": "failed",
+                    "error_message": (
+                        "Blocked before send: email verification marked this address risky "
+                        f"({getattr(lead, 'email_verification_reason', '') or 'risky'})."
+                    ),
+                },
+            )
+            failed += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "failed",
+                "reason": "risky_email_after_claim",
+            })
+            continue
+
+        state = outreach_repo.get_or_create_state(
+            lead.id,
+            draft.campaign_filename,
+        )
+        if _is_state_stopped(state):
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": state.status},
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "status": "skipped",
+                "reason": state.status,
+            })
+            continue
+
+        if suppression_repo.is_suppressed(lead.email):
+            outreach_repo.update_draft(
+                draft.id,
+                {"status": "skipped", "error_message": "suppressed"},
+            )
+            skipped += 1
+            details.append({
+                "draft_id": draft.id,
+                "lead_id": lead.id,
+                "email": lead.email,
+                "status": "skipped",
+                "reason": "suppressed_after_claim",
+            })
+            continue
         try:
             send_body, one_click_url = _with_unsubscribe_footer(
                 draft.body,
@@ -2200,6 +3271,49 @@ def _send_selected_drafts(draft_ids: list[str]) -> dict:
                     "invalid email",
                 )
             )
+            if _is_transient_graph_error(error):
+                retry_at = datetime.utcnow() + timedelta(
+                    minutes=_graph_retry_delay_minutes(),
+                )
+                outreach_repo.update_draft(
+                    draft.id,
+                    {
+                        "status": "scheduled",
+                        "scheduled_for": retry_at,
+                        "error_message": (
+                            "Deferred after transient Graph error: "
+                            f"{error}"
+                        ),
+                    },
+                )
+                state.status = "scheduled"
+                state.current_touch = max(state.current_touch, draft.touch_number)
+                outreach_repo.upsert_state(state)
+                _set_lead_sequence_columns(lead.id, "scheduled", error)
+                _add_activity(
+                    lead,
+                    draft.campaign_filename,
+                    "send_deferred",
+                    "Send deferred after transient Graph error",
+                    _dt(retry_at) or "",
+                    {
+                        "draft_id": draft.id,
+                        "touch_number": draft.touch_number,
+                        "reason": error,
+                        "retry_at": _dt(retry_at),
+                    },
+                )
+                skipped += 1
+                details.append({
+                    "draft_id": draft.id,
+                    "lead_id": lead.id,
+                    "email": lead.email,
+                    "status": "deferred",
+                    "reason": "transient_graph_error",
+                    "message": error,
+                    "retry_at": _dt(retry_at),
+                })
+                continue
             outreach_repo.update_draft(
                 draft.id,
                 {"status": "failed", "error_message": error},

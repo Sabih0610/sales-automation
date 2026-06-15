@@ -1,6 +1,7 @@
 ##src\storage.py
 import contextlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -106,9 +107,19 @@ class Database:
     def conn(self) -> sqlite3.Connection:
         # internal use only
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            self._local.conn = sqlite3.connect(self.db_path)
+            timeout_seconds = float(os.getenv("SQLITE_TIMEOUT_SECONDS", "30"))
+            busy_timeout_ms = int(timeout_seconds * 1000)
+
+            self._local.conn = sqlite3.connect(
+                self.db_path,
+                timeout=timeout_seconds,
+                check_same_thread=False,
+            )
             self._local.conn.row_factory = sqlite3.Row
             self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         return self._local.conn
 
 
@@ -227,6 +238,88 @@ class RunRepository:
             "last_page": row["last_page"] or 0,
             "leads_collected": row["leads_collected"] or 0,
         }
+
+    def _ensure_run_controls(self) -> None:
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_controls (
+                    run_id TEXT PRIMARY KEY,
+                    action TEXT NOT NULL,
+                    requested_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def request_control(self, run_id: str, action: str) -> None:
+        self._ensure_run_controls()
+        with self.db.conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO run_controls (
+                    run_id, action, requested_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (run_id, action, _dt_to_text(datetime.utcnow())),
+            )
+
+    def get_control(self, run_id: str) -> str:
+        self._ensure_run_controls()
+        row = self.db.conn().execute(
+            """
+            SELECT action
+            FROM run_controls
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        return row["action"] if row else ""
+
+    def clear_control(self, run_id: str) -> None:
+        self._ensure_run_controls()
+        with self.db.conn() as conn:
+            conn.execute(
+                "DELETE FROM run_controls WHERE run_id = ?",
+                (run_id,),
+            )
+
+    def delete_run(self, run_id: str) -> int:
+        with self.db.conn() as conn:
+            table_rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                """
+            ).fetchall()
+            tables = {row["name"] for row in table_rows}
+
+            for table in [
+                "run_controls",
+                "run_checkpoints",
+                "pipeline_events",
+                "run_events",
+                "agent_events",
+                "lead_activities",
+            ]:
+                if table in tables:
+                    try:
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE run_id = ?",
+                            (run_id,),
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+
+            if "leads" in tables:
+                conn.execute("DELETE FROM leads WHERE run_id = ?", (run_id,))
+
+            cursor = conn.execute(
+                "DELETE FROM pipeline_runs WHERE id = ?",
+                (run_id,),
+            )
+            return int(cursor.rowcount or 0)
 
     def _row_to_run(self, row: sqlite3.Row) -> PipelineRun:
         return PipelineRun(
@@ -1075,6 +1168,98 @@ class OutreachRepository:
         ).fetchall()
         return [self._row_to_draft(row) for row in rows]
 
+    def list_approved_drafts(self, campaign_filename: str) -> list[OutreachDraft]:
+        rows = self.db.conn().execute(
+            """
+            SELECT *
+            FROM outreach_drafts
+            WHERE campaign_filename = ?
+              AND status = 'approved'
+            ORDER BY created_at ASC
+            """,
+            (campaign_filename,),
+        ).fetchall()
+        return [self._row_to_draft(row) for row in rows]
+
+    def list_due_scheduled_drafts(
+        self,
+        campaign_filename: str = "",
+        limit: int = 20,
+    ) -> list[OutreachDraft]:
+        where = ["status = 'scheduled'", "scheduled_for <= ?"]
+        params: list = [_dt_to_text(datetime.utcnow())]
+        if campaign_filename:
+            where.append("campaign_filename = ?")
+            params.append(campaign_filename)
+        params.append(max(1, int(limit or 20)))
+        rows = self.db.conn().execute(
+            f"""
+            SELECT *
+            FROM outreach_drafts
+            WHERE {" AND ".join(where)}
+            ORDER BY scheduled_for ASC, created_at ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._row_to_draft(row) for row in rows]
+
+    def acquire_due_scheduled_draft(self, draft_id: str) -> Optional[OutreachDraft]:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE outreach_drafts
+                SET status = 'sending',
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'scheduled'
+                  AND scheduled_for <= ?
+                """,
+                (now, draft_id, now),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self.get_draft(draft_id)
+
+    def reset_stale_sending_to_failed_on_startup(self) -> int:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE outreach_drafts
+                SET status = 'failed',
+                    error_message = 'Interrupted while sending; send result was not recorded. Review before retrying.',
+                    updated_at = ?
+                WHERE status = 'sending'
+                """,
+                (now,),
+            )
+            return cur.rowcount
+
+    def acquire_sendable_draft(self, draft_id: str) -> Optional[OutreachDraft]:
+        now = _dt_to_text(datetime.utcnow())
+        with self.db.conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE outreach_drafts
+                SET status = 'sending',
+                    updated_at = ?
+                WHERE id = ?
+                  AND (
+                    status = 'approved'
+                    OR (
+                      status = 'scheduled'
+                      AND scheduled_for <= ?
+                    )
+                  )
+                """,
+                (now, draft_id, now),
+            )
+            if cur.rowcount != 1:
+                return None
+        return self.get_draft(draft_id)    
+
     def find_active_draft(
         self,
         lead_id: str,
@@ -1656,7 +1841,7 @@ class OutreachRepository:
             )
             draft_id = ""
             draft_status = ""
-            if draft and draft.status in {"draft", "approved"}:
+            if draft and draft.status in {"draft", "approved", "scheduled"}:
                 draft_id = draft.id
                 draft_status = draft.status
 
@@ -2793,6 +2978,25 @@ class JobRepo:
         ).fetchall()
         return [job for row in rows if (job := self._row_to_job(row))]
 
+    def has_active_campaign_job(self, job_type: str, campaign_filename: str) -> bool:
+        rows = self.db.conn().execute(
+            """
+            SELECT payload_json
+            FROM jobs
+            WHERE type = ?
+              AND status IN ('queued', 'running')
+            ORDER BY created_at DESC
+            LIMIT 500
+            """,
+            (job_type,),
+        ).fetchall()
+
+        for row in rows:
+            payload = self._json_loads(row["payload_json"])
+            if payload.get("campaign_filename") == campaign_filename:
+                return True
+        return False
+
     def mark_running(self, job_id: str) -> None:
         now = _dt_to_text(datetime.utcnow())
         with self.db.conn() as conn:
@@ -2932,6 +3136,50 @@ class JobRepo:
             """
         ).fetchone()
         return self._row_to_job(row)
+
+    def claim_next_queued(self) -> dict | None:
+        """
+        Atomically claim the next queued job by moving it to running.
+
+        This prevents two worker loops/processes from processing the same job
+        if they both poll the queue at nearly the same time.
+        """
+        now = _dt_to_text(datetime.utcnow())
+        conn = self.db.conn()
+
+        with conn:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM jobs
+                WHERE status = 'queued'
+                ORDER BY created_at ASC
+                LIMIT 1
+                """
+            ).fetchone()
+
+            if not row:
+                return None
+
+            job_id = row["id"]
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'running',
+                    started_at = CASE WHEN started_at = '' THEN ? ELSE started_at END,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'queued'
+                """,
+                (now, now, job_id),
+            )
+
+            if cur.rowcount != 1:
+                return None
+
+        return self.get(job_id)
+        
+        
 
     def reset_stale_running_to_failed_on_startup(self) -> None:
         now = _dt_to_text(datetime.utcnow())

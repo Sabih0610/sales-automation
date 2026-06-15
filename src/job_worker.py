@@ -85,6 +85,20 @@ def _generate_item_result(result: dict, lead_id: str, touch_number: int) -> tupl
     }
 
 
+def _job_send_delay_seconds(payload: dict) -> float:
+    try:
+        rate_per_minute = int(payload.get("rate_per_minute") or 0)
+    except (TypeError, ValueError):
+        rate_per_minute = 0
+
+    if rate_per_minute > 0:
+        return max(0.0, 60.0 / min(rate_per_minute, 20))
+
+    from src.send_policy import next_send_delay_seconds
+
+    return next_send_delay_seconds()
+
+
 def _run_send_selected_drafts(job: dict, stop_event: threading.Event) -> None:
     from src import api_helpers as api_module
 
@@ -133,9 +147,7 @@ def _run_send_selected_drafts(job: dict, stop_event: threading.Event) -> None:
             for remaining_id in draft_ids[index + 1:]
         )
         if item.get("status") == "sent" and has_remaining:
-            from src.send_policy import next_send_delay_seconds
-
-            stop_event.wait(next_send_delay_seconds())
+            stop_event.wait(_job_send_delay_seconds(payload))
 
 
 def _run_generate_campaign_drafts(job: dict, stop_event: threading.Event) -> None:
@@ -249,7 +261,7 @@ class JobWorker:
     def _run_loop(self) -> None:
         try:
             while not self._stop_event.is_set():
-                job = job_repo.next_queued()
+                job = job_repo.claim_next_queued()
                 if not job:
                     time.sleep(self.poll_interval_seconds)
                     continue
@@ -264,7 +276,6 @@ class JobWorker:
     def _process_job(self, job: dict) -> None:
         job_id = job["id"]
         try:
-            job_repo.mark_running(job_id)
             current = job_repo.get(job_id) or job
             if current.get("cancel_requested"):
                 job_repo.mark_cancelled(job_id)

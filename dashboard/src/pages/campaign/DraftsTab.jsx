@@ -1,29 +1,26 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import { useSearchParams } from "react-router-dom"
 import { friendlyMessage } from "../../api"
-import ConfirmSendModal from "../../components/ConfirmSendModal"
-import useJobPolling from "../../hooks/useJobPolling"
-import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts"
 import {
-  useApproveDraft,
-  useApproveSelected,
+  useApproveScheduleDrafts,
   useCampaignDrafts,
-  useSendSelected,
-  useSkipDraft,
+  useCampaignQueue,
+  useDeleteDraft,
   useUpdateDraft,
 } from "../../queries"
 import StatusPill from "./components/StatusPill.jsx"
 import {
+  defaultQueue,
   draftBody,
   draftSubject,
   getDraftId,
-  jobCompletionMessage,
-  jobProgressMessage,
-  terminalJobStatuses,
 } from "./utils.jsx"
 
-const STATUS_FILTERS = ["all", "draft", "approved", "scheduled", "sent", "failed", "skipped"]
+const VIEW_FILTERS = [
+  ["all", "All"],
+  ["action_needed", "Action needed"],
+]
 
 const FLAG_LABELS = {
   template_leak: "Template variable not filled",
@@ -33,71 +30,122 @@ const FLAG_LABELS = {
   risky_email: "Risky email",
 }
 
+const DEFAULT_RATE_PER_MINUTE =
+  Math.min(Math.max(Number(import.meta.env.VITE_BULK_SEND_RATE_PER_MINUTE || 20) || 20, 1), 20)
+
 const emptySet = () => new Set()
 
-export default function DraftsTab({
-  campaignName,
-  filename,
-  initialJobContext,
-  onSelectTab,
-  showNotice,
-}) {
+const isRemovedDraft = (draft) =>
+  String(draft?.error_message || "").toLowerCase() === "removed"
+
+const canScheduleDraft = (draft) => ["draft", "approved"].includes(draft?.status)
+
+const formatDateTimeLocal = (date = new Date()) => {
+  const pad = (value) => String(value).padStart(2, "0")
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+  ].join("-") + `T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function summarizeQueue(queueData, drafts) {
+  const queue = { ...defaultQueue, ...(queueData || {}) }
+  const items = Array.isArray(queue.items)
+    ? queue.items
+    : [
+        ...(queue.due_today || []),
+        ...(queue.scheduled || []),
+        ...(queue.waiting || []),
+      ]
+  const statusCount = (values) =>
+    items.filter((item) =>
+      values.includes(String(item.status || item.draft_status || "").toLowerCase()),
+    ).length
+
+  return {
+    queued:
+      (queue.due_today?.length || 0) +
+      (queue.waiting?.length || 0) +
+      statusCount(["queued", "pending"]),
+    scheduled: Math.max(
+      queue.scheduled?.length || 0,
+      drafts.filter((draft) => draft.status === "scheduled").length,
+    ),
+    sending: statusCount(["sending", "running", "in_progress"]),
+    failed:
+      (queue.failed?.length || 0) +
+      drafts.filter((draft) => draft.status === "failed").length,
+  }
+}
+
+export default function DraftsTab({ filename, showNotice }) {
   const queryClient = useQueryClient()
   const [params, setParams] = useSearchParams()
 
   const { data: drafts = [], isLoading } = useCampaignDrafts(filename, { limit: 1000 })
+  const { data: queueData = defaultQueue } = useCampaignQueue(filename)
   const updateDraft = useUpdateDraft(filename)
-  const approveDraft = useApproveDraft(filename)
-  const approveSelected = useApproveSelected(filename)
-  const skipDraft = useSkipDraft(filename)
-  const sendSelected = useSendSelected(filename)
+  const approveSchedule = useApproveScheduleDrafts(filename)
+  const removeDraft = useDeleteDraft(filename)
 
-  const [statusFilter, setStatusFilter] = useState("all")
-  const [touchFilter, setTouchFilter] = useState("")
+  const [viewFilter, setViewFilter] = useState("all")
   const [checkedIds, setCheckedIds] = useState(emptySet)
   const [editing, setEditing] = useState(false)
   const [editSubject, setEditSubject] = useState("")
   const [editBody, setEditBody] = useState("")
-  const [pendingSendDraftIds, setPendingSendDraftIds] = useState(null)
-  const [activeJobContext, setActiveJobContext] = useState(null)
+  const [scheduleModal, setScheduleModal] = useState(null)
+  const [startMode, setStartMode] = useState("now")
+  const [startAt, setStartAt] = useState(formatDateTimeLocal())
+  const [ratePerMinute, setRatePerMinute] = useState(DEFAULT_RATE_PER_MINUTE)
 
-  const viewedIdsRef = useRef(new Set())
-  const progressToastIdRef = useRef(null)
-  const initialJobIdRef = useRef("")
-  const { job: activeJob, error: activeJobError } = useJobPolling(activeJobContext?.id || "")
-
-  const filteredDrafts = useMemo(() => {
-    return drafts.filter((draft) => {
-      if (statusFilter !== "all" && draft.status !== statusFilter) return false
-      if (touchFilter && String(draft.touch_number) !== String(touchFilter)) return false
-      return true
-    })
-  }, [drafts, statusFilter, touchFilter])
+  const visibleDrafts = useMemo(() => {
+    const liveDrafts = drafts.filter((draft) => !isRemovedDraft(draft))
+    if (viewFilter === "action_needed") {
+      return liveDrafts.filter(canScheduleDraft)
+    }
+    return liveDrafts
+  }, [drafts, viewFilter])
 
   const selectedIdFromUrl = params.get("draft") || ""
   const currentDraft =
-    filteredDrafts.find((draft) => getDraftId(draft) === selectedIdFromUrl) ||
-    filteredDrafts[0] ||
+    visibleDrafts.find((draft) => getDraftId(draft) === selectedIdFromUrl) ||
+    visibleDrafts[0] ||
     null
-
   const currentDraftId = getDraftId(currentDraft)
 
-  const selectedApprovedIds = Array.from(checkedIds).filter((draftId) =>
-    filteredDrafts.some((draft) => getDraftId(draft) === draftId && draft.status === "approved"),
+  const visibleSchedulableIds = useMemo(
+    () =>
+      visibleDrafts
+        .filter(canScheduleDraft)
+        .map((draft) => getDraftId(draft))
+        .filter(Boolean),
+    [visibleDrafts],
   )
+  const visibleSchedulableIdSet = useMemo(
+    () => new Set(visibleSchedulableIds),
+    [visibleSchedulableIds],
+  )
+  const visibleSelectedIds = useMemo(
+    () => Array.from(checkedIds).filter((draftId) => visibleSchedulableIdSet.has(draftId)),
+    [checkedIds, visibleSchedulableIdSet],
+  )
+  const allVisibleSelected =
+    visibleSchedulableIds.length > 0 &&
+    visibleSchedulableIds.every((draftId) => checkedIds.has(draftId))
+  const someVisibleSelected = visibleSelectedIds.length > 0
 
   const actionBusy =
     updateDraft.isPending ||
-    approveDraft.isPending ||
-    approveSelected.isPending ||
-    skipDraft.isPending ||
-    sendSelected.isPending ||
-    Boolean(activeJobContext)
+    approveSchedule.isPending ||
+    removeDraft.isPending
 
-  useEffect(() => {
-    if (!currentDraftId) return
-    viewedIdsRef.current.add(currentDraftId)
-  }, [currentDraftId])
+  const queueStats = useMemo(
+    () => summarizeQueue(queueData, drafts.filter((draft) => !isRemovedDraft(draft))),
+    [drafts, queueData],
+  )
+  const currentRiskFlags = Array.isArray(currentDraft?.risk_flags) ? currentDraft.risk_flags : []
+  const currentKbSources = Array.isArray(currentDraft?.kb_sources) ? currentDraft.kb_sources : []
 
   useEffect(() => {
     if (!currentDraft) {
@@ -114,61 +162,13 @@ export default function DraftsTab({
   }, [currentDraftId, currentDraft, editing])
 
   useEffect(() => {
-    if (!initialJobContext?.id || initialJobIdRef.current === initialJobContext.id) return
-    initialJobIdRef.current = initialJobContext.id
-    progressToastIdRef.current = showNotice("Sending started", false, {
-      title: "Sending started",
-      detail: jobProgressMessage(
-        { total: initialJobContext.total, done: 0, failed: 0, skipped: 0 },
-        initialJobContext,
-      ),
-      type: "info",
-      persist: true,
+    setCheckedIds((current) => {
+      const next = new Set(
+        Array.from(current).filter((draftId) => visibleSchedulableIdSet.has(draftId)),
+      )
+      return next.size === current.size ? current : next
     })
-    setActiveJobContext(initialJobContext)
-  }, [initialJobContext, showNotice])
-
-  useEffect(() => {
-    if (activeJobError && activeJobContext) {
-      const timer = window.setTimeout(() => showNotice(activeJobError, true), 0)
-      return () => window.clearTimeout(timer)
-    }
-    return undefined
-  }, [activeJobContext, activeJobError, showNotice])
-
-  useEffect(() => {
-    if (!activeJob || !activeJobContext || activeJob.id !== activeJobContext.id) return undefined
-
-    if (!terminalJobStatuses.has(activeJob.status)) {
-      const timer = window.setTimeout(() => {
-        showNotice(jobProgressMessage(activeJob, activeJobContext), false, {
-          progressId: progressToastIdRef.current,
-          title: "Sending started",
-          detail: jobProgressMessage(activeJob, activeJobContext),
-          type: "info",
-          persist: true,
-        })
-      }, 0)
-      return () => window.clearTimeout(timer)
-    }
-
-    const isError = activeJob.status !== "done"
-    showNotice(jobCompletionMessage(activeJob, activeJobContext), isError, {
-      progressId: progressToastIdRef.current,
-      actionLabel: "View drafts",
-      onAction: () => onSelectTab("drafts"),
-    })
-
-    progressToastIdRef.current = null
-    queryClient.invalidateQueries({ queryKey: ["campaign", filename] })
-
-    if (activeJob.status === "done" && activeJobContext.clearDrafts) {
-      setCheckedIds(emptySet())
-    }
-
-    setActiveJobContext(null)
-    return undefined
-  }, [activeJob, activeJobContext, filename, onSelectTab, queryClient, showNotice])
+  }, [visibleSchedulableIdSet])
 
   const setSelectedDraft = (draftId) => {
     const next = new URLSearchParams(params)
@@ -178,23 +178,8 @@ export default function DraftsTab({
     setEditing(false)
   }
 
-  const moveSelection = (delta) => {
-    if (!filteredDrafts.length) return
-
-    const currentIndex = Math.max(
-      0,
-      filteredDrafts.findIndex((draft) => getDraftId(draft) === currentDraftId),
-    )
-    const nextIndex = Math.min(
-      filteredDrafts.length - 1,
-      Math.max(0, currentIndex + delta),
-    )
-    const nextDraft = filteredDrafts[nextIndex]
-
-    if (nextDraft) setSelectedDraft(getDraftId(nextDraft))
-  }
-
   const toggleChecked = (draftId) => {
+    if (!visibleSchedulableIdSet.has(draftId)) return
     setCheckedIds((current) => {
       const next = new Set(current)
       if (next.has(draftId)) next.delete(draftId)
@@ -202,6 +187,20 @@ export default function DraftsTab({
       return next
     })
   }
+
+  const toggleSelectAllVisible = () => {
+    setCheckedIds((current) => {
+      const next = new Set(current)
+      if (allVisibleSelected) {
+        visibleSchedulableIds.forEach((draftId) => next.delete(draftId))
+      } else {
+        visibleSchedulableIds.forEach((draftId) => next.add(draftId))
+      }
+      return next
+    })
+  }
+
+  const clearSelection = () => setCheckedIds(emptySet())
 
   const startEdit = () => {
     if (!currentDraft) return
@@ -228,11 +227,48 @@ export default function DraftsTab({
     }
   }
 
-  const approveCurrent = async () => {
-    if (!currentDraft || currentDraft.status !== "draft") return
+  const removeDraftById = async (draft) => {
+    const draftId = getDraftId(draft)
+    if (!draftId) return
+    if (!window.confirm("Remove this draft from the review list?")) return
 
     try {
-      if (editing) {
+      await removeDraft.mutateAsync(draftId)
+      setCheckedIds((current) => {
+        const next = new Set(current)
+        next.delete(draftId)
+        return next
+      })
+      if (draftId === currentDraftId) setSelectedDraft("")
+      showNotice("Draft removed")
+    } catch (err) {
+      showNotice(friendlyMessage(err) || "Draft remove failed", true)
+    }
+  }
+
+  const openApproveSchedule = () => {
+    const draftIds = visibleSelectedIds
+    if (!draftIds.length) {
+      showNotice("Select drafts to schedule first.", true)
+      return
+    }
+    setStartMode("now")
+    setStartAt(formatDateTimeLocal())
+    setRatePerMinute(DEFAULT_RATE_PER_MINUTE)
+    setScheduleModal({ draftIds })
+  }
+
+  const submitApproveSchedule = async () => {
+    if (!scheduleModal?.draftIds?.length) return
+    const cleanRate = Math.min(Math.max(Number(ratePerMinute) || DEFAULT_RATE_PER_MINUTE, 1), 20)
+
+    if (startMode === "later" && !startAt) {
+      showNotice("Choose a start time.", true)
+      return
+    }
+
+    try {
+      if (editing && currentDraft && scheduleModal.draftIds.includes(currentDraftId)) {
         await updateDraft.mutateAsync({
           draftId: currentDraftId,
           data: {
@@ -243,189 +279,63 @@ export default function DraftsTab({
         setEditing(false)
       }
 
-      await approveDraft.mutateAsync(currentDraftId)
-      showNotice("Draft approved")
-      moveSelection(1)
-    } catch (err) {
-      showNotice(friendlyMessage(err) || "Draft approval failed", true)
-    }
-  }
-
-  const skipCurrent = async () => {
-    if (!currentDraft) return
-
-    try {
-      await skipDraft.mutateAsync({
-        draftId: currentDraftId,
-        reasonOrBody: { reason: "Skipped from triage review" },
+      const res = await approveSchedule.mutateAsync({
+        draft_ids: scheduleModal.draftIds,
+        start_mode: startMode,
+        start_at: startMode === "later" ? startAt : "",
+        rate_per_minute: cleanRate,
       })
-      showNotice("Draft skipped")
-      moveSelection(1)
-    } catch (err) {
-      showNotice(friendlyMessage(err) || "Draft skip failed", true)
-    }
-  }
-
-  const approveChecked = async () => {
-    const draftIds = Array.from(checkedIds)
-
-    if (!draftIds.length) {
-      showNotice("Select drafts first.", true)
-      return
-    }
-
-    try {
-      const res = await approveSelected.mutateAsync({ draft_ids: draftIds })
-      showNotice(`${res.data.approved || 0} drafts approved`)
+      const count = res.data?.scheduled || 0
+      showNotice(`Scheduled ${count} emails. Sending will start automatically.`)
+      queryClient.invalidateQueries({ queryKey: ["campaign", filename] })
       setCheckedIds(emptySet())
+      setScheduleModal(null)
     } catch (err) {
-      showNotice(friendlyMessage(err) || "Bulk approval failed", true)
+      showNotice(friendlyMessage(err) || "Scheduling failed", true)
     }
   }
-
-  const approveAllFiltered = async () => {
-    const draftIds = filteredDrafts
-      .filter((draft) => draft.status === "draft")
-      .map((draft) => getDraftId(draft))
-
-    if (!draftIds.length) {
-      showNotice("No draft items to approve.", true)
-      return
-    }
-
-    try {
-      const res = await approveSelected.mutateAsync({ draft_ids: draftIds })
-      showNotice(`${res.data.approved || 0} drafts approved`)
-      setCheckedIds(emptySet())
-    } catch (err) {
-      showNotice(friendlyMessage(err) || "Bulk approval failed", true)
-    }
-  }
-
-  const startJob = (res, context) => {
-    const jobId = res.data?.job_id
-
-    if (!jobId) {
-      showNotice("Job was not created", true)
-      return false
-    }
-
-    setActiveJobContext({ ...context, id: jobId })
-    progressToastIdRef.current = showNotice("Sending started", false, {
-      title: "Sending started",
-      detail: jobProgressMessage(
-        { total: context.total, done: 0, failed: 0, skipped: 0 },
-        context,
-      ),
-      type: "info",
-      persist: true,
-    })
-    return true
-  }
-
-  const sendApprovedDrafts = async (draftIds = selectedApprovedIds) => {
-    if (!draftIds.length) {
-      showNotice("Approve drafts before sending.", true)
-      return
-    }
-
-    try {
-      if (editing && currentDraft && draftIds.includes(currentDraftId)) {
-        await updateDraft.mutateAsync({
-          draftId: currentDraftId,
-          data: {
-            subject: editSubject,
-            body: editBody,
-          },
-        })
-        setEditing(false)
-      }
-
-      const res = await sendSelected.mutateAsync({ draft_ids: draftIds })
-      startJob(res, {
-        kind: "send",
-        total: draftIds.length,
-        progressLabel: "Sending",
-        doneLabel: "Send",
-        clearDrafts: true,
-      })
-    } catch (err) {
-      showNotice(friendlyMessage(err) || "Send failed", true)
-    }
-  }
-
-  const requestSendApproved = async () => {
-    if (!selectedApprovedIds.length) {
-      showNotice("Select approved drafts before sending.", true)
-      return
-    }
-
-    if (selectedApprovedIds.length >= 5) {
-      setPendingSendDraftIds(selectedApprovedIds)
-      return
-    }
-
-    await sendApprovedDrafts(selectedApprovedIds)
-  }
-
-  const viewedTarget = Math.min(10, filteredDrafts.length)
-  const bulkApproveDisabled = viewedIdsRef.current.size < viewedTarget
-  const currentRiskFlags = Array.isArray(currentDraft?.risk_flags) ? currentDraft.risk_flags : []
-  const currentKbSources = Array.isArray(currentDraft?.kb_sources) ? currentDraft.kb_sources : []
-
-  useKeyboardShortcuts(
-    {
-      j: () => moveSelection(1),
-      arrowdown: () => moveSelection(1),
-      k: () => moveSelection(-1),
-      arrowup: () => moveSelection(-1),
-      a: approveCurrent,
-      s: skipCurrent,
-      e: startEdit,
-      escape: () => setEditing(false),
-    },
-    !editing && !actionBusy,
-  )
 
   return (
     <>
       <div className="draft-triage-page">
         <div className="draft-triage-toolbar">
           <div className="topbar-actions">
-            {STATUS_FILTERS.map((status) => (
+            {VIEW_FILTERS.map(([value, label]) => (
               <button
-                className={`filter-pill ${statusFilter === status ? "active" : ""}`}
-                key={status}
+                className={`filter-pill ${viewFilter === value ? "active" : ""}`}
+                key={value}
                 onClick={() => {
-                  setStatusFilter(status)
+                  setViewFilter(value)
                   setSelectedDraft("")
                 }}
                 type="button"
               >
-                {status}
+                {label}
               </button>
             ))}
-
-            <select
-              className="form-input compact"
-              value={touchFilter}
-              onChange={(event) => {
-                setTouchFilter(event.target.value)
-                setSelectedDraft("")
-              }}
-            >
-              <option value="">All emails</option>
-              {[1, 2, 3].map((touch) => (
-                <option key={touch} value={touch}>
-                  Email {touch}
-                </option>
-              ))}
-            </select>
           </div>
 
-          <div className="shortcut-legend">
-            J/K move · A approve · S skip · E edit
-          </div>
+          <button
+            className="btn sm"
+            onClick={() => queryClient.invalidateQueries({ queryKey: ["campaign", filename, "drafts"] })}
+            type="button"
+          >
+            Refresh
+          </button>
+        </div>
+
+        <div className="draft-queue-summary">
+          {[
+            ["Queued", queueStats.queued],
+            ["Scheduled", queueStats.scheduled],
+            ["Sending", queueStats.sending],
+            ["Failed", queueStats.failed],
+          ].map(([label, value]) => (
+            <div className="draft-queue-stat" key={label}>
+              <strong>{value}</strong>
+              <span>{label}</span>
+            </div>
+          ))}
         </div>
 
         <div className="triage-layout">
@@ -433,46 +343,72 @@ export default function DraftsTab({
             <div className="triage-list-head">
               <div>
                 <h2>Draft review</h2>
-                <p>{filteredDrafts.length} drafts in this view</p>
+                <p>
+                  {visibleDrafts.length} drafts
+                  {someVisibleSelected ? ` - ${visibleSelectedIds.length} selected` : ""}
+                </p>
               </div>
-              <button
-                className="btn sm"
-                onClick={() => queryClient.invalidateQueries({ queryKey: ["campaign", filename, "drafts"] })}
-                type="button"
-              >
-                Refresh
-              </button>
+            </div>
+
+            <div className="selection-bar">
+              <label className="select-visible-control">
+                <input
+                  checked={allVisibleSelected}
+                  disabled={!visibleSchedulableIds.length || actionBusy}
+                  onChange={toggleSelectAllVisible}
+                  type="checkbox"
+                />
+                <span>Select all visible</span>
+              </label>
+
+              {someVisibleSelected && (
+                <button
+                  className="btn sm"
+                  disabled={actionBusy}
+                  onClick={clearSelection}
+                  type="button"
+                >
+                  Clear selection
+                </button>
+              )}
             </div>
 
             <div className="triage-rows">
-              {isLoading && <p className="empty-line">Loading drafts…</p>}
+              {isLoading && <p className="empty-line">Loading drafts...</p>}
 
-              {!isLoading && filteredDrafts.length === 0 && (
+              {!isLoading && visibleDrafts.length === 0 && (
                 <div className="triage-empty">
-                  <p>No drafts match this view.</p>
-                  <button
-                    className="btn sm"
-                    onClick={() => {
-                      setStatusFilter("all")
-                      setTouchFilter("")
-                    }}
-                    type="button"
-                  >
-                    Clear filters
-                  </button>
+                  <p>No drafts in this view.</p>
+                  {viewFilter !== "all" && (
+                    <button
+                      className="btn sm"
+                      onClick={() => setViewFilter("all")}
+                      type="button"
+                    >
+                      Show all
+                    </button>
+                  )}
                 </div>
               )}
 
-              {filteredDrafts.map((draft) => {
+              {visibleDrafts.map((draft) => {
                 const draftId = getDraftId(draft)
                 const flags = Array.isArray(draft.risk_flags) ? draft.risk_flags : []
+                const selectable = canScheduleDraft(draft)
 
                 return (
-                  <button
+                  <div
                     className={`triage-row ${draftId === currentDraftId ? "selected" : ""}`}
                     key={draftId}
                     onClick={() => setSelectedDraft(draftId)}
-                    type="button"
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault()
+                        setSelectedDraft(draftId)
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
                   >
                     <span
                       className="triage-check"
@@ -480,6 +416,7 @@ export default function DraftsTab({
                     >
                       <input
                         checked={checkedIds.has(draftId)}
+                        disabled={!selectable || actionBusy}
                         onChange={() => toggleChecked(draftId)}
                         type="checkbox"
                       />
@@ -487,7 +424,7 @@ export default function DraftsTab({
 
                     <span className="triage-row-main">
                       <strong>{draft.full_name || draft.email || "Unknown lead"}</strong>
-                      <small>{draft.company || "—"} · {draft.title || "—"}</small>
+                      <small>{draft.company || "-"} - {draft.title || "-"}</small>
                       <span>{draftSubject(draft) || "No subject"}</span>
                     </span>
 
@@ -498,47 +435,37 @@ export default function DraftsTab({
                         className="risk-dot"
                         title={flags.map((flag) => FLAG_LABELS[flag] || flag).join(", ")}
                       >
-                        ⚠
+                        !
                       </span>
                     )}
 
                     <StatusPill value={draft.status} />
-                  </button>
+
+                    <button
+                      aria-label="Remove draft"
+                      className="draft-remove-button"
+                      disabled={actionBusy}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        removeDraftById(draft)
+                      }}
+                      type="button"
+                    >
+                      <i className="ti ti-x" aria-hidden="true" />
+                    </button>
+                  </div>
                 )
               })}
             </div>
 
-            <div className="bulk-bar">
+            <div className="bulk-bar simplified">
               <button
-                className="btn sm"
-                disabled={checkedIds.size === 0 || actionBusy}
-                onClick={approveChecked}
+                className="btn primary"
+                disabled={visibleSelectedIds.length === 0 || actionBusy}
+                onClick={openApproveSchedule}
                 type="button"
               >
-                Approve selected ({checkedIds.size})
-              </button>
-
-              <button
-                className="btn primary sm"
-                disabled={selectedApprovedIds.length === 0 || actionBusy}
-                onClick={requestSendApproved}
-                type="button"
-              >
-                Send approved ({selectedApprovedIds.length})
-              </button>
-
-              <button
-                className="btn sm"
-                disabled={bulkApproveDisabled || actionBusy}
-                onClick={approveAllFiltered}
-                title={
-                  bulkApproveDisabled
-                    ? `View at least ${viewedTarget} drafts before approving all filtered`
-                    : ""
-                }
-                type="button"
-              >
-                Approve all filtered
+                Approve &amp; Schedule ({visibleSelectedIds.length})
               </button>
             </div>
           </aside>
@@ -547,7 +474,7 @@ export default function DraftsTab({
             {!currentDraft && (
               <div className="triage-empty large">
                 <h2>Select a draft</h2>
-                <p>Choose a draft from the left to review, edit, approve, or skip.</p>
+                <p>Choose a draft from the list to review or edit.</p>
               </div>
             )}
 
@@ -564,7 +491,7 @@ export default function DraftsTab({
                   </div>
                   <div>
                     <span>Lead</span>
-                    <strong>{currentDraft.full_name || "Unknown lead"} · {currentDraft.company || "—"}</strong>
+                    <strong>{currentDraft.full_name || "Unknown lead"} - {currentDraft.company || "-"}</strong>
                   </div>
                 </div>
 
@@ -626,31 +553,21 @@ export default function DraftsTab({
                     </>
                   ) : (
                     <>
-                      {currentDraft.status === "draft" && (
-                        <button
-                          className="btn primary"
-                          disabled={actionBusy}
-                          onClick={approveCurrent}
-                          type="button"
-                        >
-                          Approve (A)
-                        </button>
-                      )}
                       <button
                         className="btn"
                         disabled={actionBusy}
                         onClick={startEdit}
                         type="button"
                       >
-                        Edit (E)
+                        Edit
                       </button>
                       <button
                         className="btn danger"
                         disabled={actionBusy}
-                        onClick={skipCurrent}
+                        onClick={() => removeDraftById(currentDraft)}
                         type="button"
                       >
-                        Skip (S)
+                        Remove
                       </button>
                     </>
                   )}
@@ -678,13 +595,83 @@ export default function DraftsTab({
         </div>
       </div>
 
-      {pendingSendDraftIds && (
-        <ConfirmSendModal
-          campaignName={campaignName}
-          count={pendingSendDraftIds.length}
-          onClose={() => setPendingSendDraftIds(null)}
-          onConfirm={() => sendApprovedDrafts(pendingSendDraftIds)}
-        />
+      {scheduleModal && (
+        <div className="modal-backdrop" onClick={() => setScheduleModal(null)}>
+          <div className="modal-card approve-schedule-modal" onClick={(event) => event.stopPropagation()}>
+            <h3>Approve &amp; schedule {scheduleModal.draftIds.length} emails</h3>
+            <p>These emails will be queued and sent automatically through Microsoft Graph.</p>
+
+            <div className="schedule-modal-form">
+              <div className="form-group">
+                <div className="form-label">Start time</div>
+                <div className="segmented-radio-row">
+                  <label>
+                    <input
+                      checked={startMode === "now"}
+                      onChange={() => setStartMode("now")}
+                      type="radio"
+                    />
+                    Now
+                  </label>
+                  <label>
+                    <input
+                      checked={startMode === "later"}
+                      onChange={() => setStartMode("later")}
+                      type="radio"
+                    />
+                    Later
+                  </label>
+                </div>
+              </div>
+
+              {startMode === "later" && (
+                <div className="form-group">
+                  <div className="form-label">Date and time</div>
+                  <input
+                    className="form-input"
+                    onChange={(event) => setStartAt(event.target.value)}
+                    type="datetime-local"
+                    value={startAt}
+                  />
+                </div>
+              )}
+
+              <div className="form-group">
+                <div className="form-label">Rate</div>
+                <div className="rate-input-row">
+                  <input
+                    className="form-input"
+                    max="20"
+                    min="1"
+                    onChange={(event) => setRatePerMinute(event.target.value)}
+                    type="number"
+                    value={ratePerMinute}
+                  />
+                  <span>emails per minute</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="modal-actions">
+              <button
+                className="btn"
+                disabled={actionBusy}
+                onClick={() => setScheduleModal(null)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="btn primary"
+                disabled={actionBusy || (startMode === "later" && !startAt)}
+                onClick={submitApproveSchedule}
+                type="button"
+              >
+                Approve &amp; Schedule {scheduleModal.draftIds.length} emails
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </>
   )

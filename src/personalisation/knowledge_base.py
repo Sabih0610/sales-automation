@@ -1,3 +1,4 @@
+from dataclasses import fields
 import math
 import pathlib
 import re
@@ -25,11 +26,19 @@ class KnowledgeBaseLoader:
                     break
         if not campaign:
             raise FileNotFoundError(f"Campaign not found: {campaign_file}")
-        data = {
+        raw_data = {
             "name": campaign.get("name", ""),
             "description": campaign.get("description", ""),
             **(campaign.get("config") or {}),
         }
+
+        allowed_fields = {field.name for field in fields(CampaignConfig)}
+        data = {
+            key: value
+            for key, value in raw_data.items()
+            if key in allowed_fields
+        }
+
         return CampaignConfig(**data)
 
     @staticmethod

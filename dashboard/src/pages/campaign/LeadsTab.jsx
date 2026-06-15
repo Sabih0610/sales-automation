@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { downloadFile, friendlyMessage } from "../../api"
+import { downloadFile, friendlyMessage, getCampaignLeads } from "../../api"
 import TableSkeleton from "../../components/TableSkeleton.jsx"
 import {
   useCampaignDrafts,
@@ -15,6 +15,7 @@ import ReconciliationReportModal from "../../components/ReconciliationReportModa
 
 import LeadDrawer from "./components/LeadDrawer.jsx"
 import StatusPill from "./components/StatusPill.jsx"
+import SourcesTab from "./SourcesTab.jsx"
 import {
   getLeadId,
   latestByLead,
@@ -27,9 +28,9 @@ const SEGMENT_FILTERS = [
 ]
 
 const SEQUENCE_FILTERS = [
-  ["replied", "Replied"],
-  ["bounced", "Bounced"],
-  ["unsubscribed", "Unsubscribed"],
+  ["sent", "Sent"],
+  ["scheduled", "Queued"],
+  ["waiting_followup", "Waiting follow-up"],
 ]
 
 function EmailVerificationBadge({ lead }) {
@@ -111,6 +112,8 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
   const [selectedLeadIds, setSelectedLeadIds] = useState([])
   const [leadDrawer, setLeadDrawer] = useState(null)
   const [reconciliationResult, setReconciliationResult] = useState(null)
+  const [sourceToolsOpen, setSourceToolsOpen] = useState(false)
+  const [selectingAll, setSelectingAll] = useState(false)
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -184,9 +187,7 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
     do_not_contact: markLeadDoNotContact,
   }
 
-  const selectedEmailLeadIds = selectedLeadIds.filter((leadId) =>
-    leads.some((lead) => lead.id === leadId && lead.email),
-  )
+  const selectedEmailLeadIds = selectedLeadIds
 
   const hasFilters = Boolean(q || segment || sequenceStatus)
 
@@ -207,12 +208,47 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
     setSelectedLeadIds([])
   }
 
-  const selectFirstFiveWithEmail = () => {
-    setSelectedLeadIds(leads.filter((lead) => lead.email).slice(0, 5).map((lead) => lead.id))
-  }
+  const selectAllMatchingWithEmail = async () => {
+    setSelectingAll(true)
 
-  const selectVisibleWithEmail = () => {
-    setSelectedLeadIds(leads.filter((lead) => lead.email).map((lead) => lead.id))
+    try {
+      const allIds = []
+      const seen = new Set()
+      const selectionSegment = segment === "needs_enrichment" ? "with_email" : (segment || "with_email")
+      let nextPage = 1
+      let totalMatching = 0
+
+      while (true) {
+        const response = await getCampaignLeads(filename, {
+          page: nextPage,
+          page_size: 200,
+          q,
+          segment: selectionSegment,
+          sequence_status: sequenceStatus,
+        })
+
+        const data = response?.data || response
+        const items = safeItems(data)
+        totalMatching = safeTotal(data)
+
+        items.forEach((lead) => {
+          if (lead.email && !seen.has(lead.id)) {
+            seen.add(lead.id)
+            allIds.push(lead.id)
+          }
+        })
+
+        if (!items.length || nextPage * 200 >= totalMatching) break
+        nextPage += 1
+      }
+
+      setSelectedLeadIds(allIds)
+      showNotice(`Selected ${allIds.length} leads with email across all pages.`)
+    } catch (err) {
+      showNotice(friendlyMessage(err) || "Could not select leads across pages.", true)
+    } finally {
+      setSelectingAll(false)
+    }
   }
 
   const handleExportZoomInfo = async () => {
@@ -260,18 +296,31 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
         lead_ids: leadIds,
         touch_number: touchNumber,
       })
-      showNotice("Draft generation queued")
+      showNotice(`Draft generation queued for ${leadIds.length} lead${leadIds.length === 1 ? "" : "s"}.`)
+
+      const queuedJobId = res?.data?.job_id || res?.job_id || ""
+      const draftJobContext = {
+        id: queuedJobId,
+        kind: "generate",
+        total: leadIds.length,
+        progressLabel: "Generating",
+        doneLabel: "Draft generation",
+        clearDrafts: false,
+      }
+
+      if (draftJobContext.id) {
+        try {
+          window.sessionStorage.setItem(
+            `draftJobContext:${filename}`,
+            JSON.stringify(draftJobContext),
+          )
+        } catch {
+          // Ignore storage failures.
+        }
+      }
+
       setSelectedLeadIds([])
-      onSelectTab("drafts", {
-        draftJobContext: {
-          id: res.data?.job_id,
-          kind: "generate",
-          total: leadIds.length,
-          progressLabel: "Generating",
-          doneLabel: "Draft generation",
-          clearDrafts: false,
-        },
-      })
+      onSelectTab("drafts", { draftJobContext })
     } catch (err) {
       showNotice(friendlyMessage(err) || "Draft generation failed", true)
     }
@@ -300,24 +349,43 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
 
   return (
     <>
+      <details
+        className="embedded-tool-panel lead-source-panel"
+        onToggle={(event) => setSourceToolsOpen(event.currentTarget.open)}
+        open={sourceToolsOpen}
+      >
+        <summary>
+          <span>
+            <strong>Lead acquisition</strong>
+            <small>Import, scrape, and manage source runs</small>
+          </span>
+          <span className="btn sm" aria-hidden="true">
+            {sourceToolsOpen ? "Hide tools" : "Open tools"}
+          </span>
+        </summary>
+        <div className="embedded-tool-body">
+          <SourcesTab filename={filename} showNotice={showNotice} />
+        </div>
+      </details>
+
       <div className="leads-page card">
         <div className="card-head leads-card-head">
           <div>
             <h2>Leads and enrichment</h2>
             <p>
-              Server-paginated list with search, status filters, enrichment actions, and draft generation.
+              Manage lead data, enrichment, verification, and draft generation.
             </p>
           </div>
 
           <div className="topbar-actions">
             <button className="btn sm" onClick={handleExportZoomInfo} type="button">
               <i className="ti ti-download" aria-hidden="true" />
-              Export for ZoomInfo
+              Export CSV
             </button>
 
             <label className="btn sm">
               <i className="ti ti-upload" aria-hidden="true" />
-              {uploadingEnriched ? "Uploading..." : "Upload enriched file"}
+              {uploadingEnriched ? "Uploading..." : "Upload leads/enriched"}
               <input
                 accept=".csv,.xlsx"
                 onChange={handleUploadEnriched}
@@ -326,36 +394,32 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
               />
             </label>
 
-            <button className="btn sm" onClick={selectFirstFiveWithEmail} type="button">
-              Select first 5
-            </button>
-
             <button
               className="btn sm"
-              disabled={verifyCampaignEmails.isPending}
-              onClick={handleVerifyEmails}
+              disabled={selectingAll || isFetching}
+              onClick={selectAllMatchingWithEmail}
               type="button"
             >
-              {verifyCampaignEmails.isPending ? "Verifying..." : "Verify emails"}
+              {selectingAll ? "Selecting..." : "Select all with email"}
             </button>
 
-            <button className="btn sm" onClick={selectVisibleWithEmail} type="button">
-              Select visible
-            </button>
-
-            <button className="btn sm" onClick={() => setSelectedLeadIds([])} type="button">
-              Clear
-            </button>
+            {selectedLeadIds.length > 0 && (
+              <button className="btn sm" onClick={() => setSelectedLeadIds([])} type="button">
+                Clear
+              </button>
+            )}
 
             <button
               className="btn primary sm"
-              disabled={selectedEmailLeadIds.length === 0}
+              disabled={selectedEmailLeadIds.length === 0 || generateDrafts.isPending || selectingAll}
               onClick={() => handleGenerateDrafts()}
               title={selectedEmailLeadIds.length === 0 ? "Select leads with email first." : ""}
               type="button"
             >
-              <i className="ti ti-sparkles" aria-hidden="true" />
-              Generate drafts ({selectedEmailLeadIds.length})
+              <i className={`ti ${generateDrafts.isPending ? "ti-loader-2 spinner-inline" : "ti-sparkles"}`} aria-hidden="true" />
+              {generateDrafts.isPending
+                ? `Queuing drafts (${selectedEmailLeadIds.length})`
+                : `Generate drafts (${selectedEmailLeadIds.length})`}
             </button>
           </div>
         </div>
@@ -426,7 +490,7 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
         {selectedLeadIds.length > 0 && (
           <div className="selection-bar">
             <strong>{selectedLeadIds.length}</strong>
-            <span>selected on this page</span>
+            <span>selected across this campaign</span>
             <button className="btn xs" onClick={() => setSelectedLeadIds([])} type="button">
               Clear selection
             </button>
@@ -465,9 +529,9 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
                       ) : (
                         <div className="inline-empty">
                           <strong>No leads yet.</strong>
-                          <span>Add a Sales Navigator source from the Sources tab.</span>
-                          <button className="btn sm primary" onClick={() => onSelectTab("sources")} type="button">
-                            Go to Sources
+                          <span>Add or import leads to start this campaign.</span>
+                          <button className="btn sm primary" onClick={() => setSourceToolsOpen(true)} type="button">
+                            Open Lead Tools
                           </button>
                         </div>
                       )}
@@ -488,7 +552,7 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
                       <td>
                         <input
                           checked={selectedLeadIds.includes(lead.id)}
-                          disabled={!lead.email}
+                          disabled={!lead.email || selectingAll || generateDrafts.isPending}
                           onChange={() => toggleLead(lead.id)}
                           type="checkbox"
                         />

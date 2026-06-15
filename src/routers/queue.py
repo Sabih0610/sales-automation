@@ -185,25 +185,14 @@ def send_selected_campaign_queue_drafts(
 ) -> dict:
     if not request.draft_ids:
         raise HTTPException(status_code=400, detail="draft_ids are required")
-    drafts = outreach_repo.get_drafts_by_ids(request.draft_ids)
-    invalid = [
-        draft.id for draft in drafts
-        if draft.campaign_filename != campaign_filename
-    ]
-    if invalid:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Drafts do not belong to campaign: {', '.join(invalid)}",
-        )
-    job = job_repo.create(
-        "send_selected_drafts",
-        {
-            "draft_ids": request.draft_ids,
-            "campaign_filename": campaign_filename,
-        },
-        total=len(request.draft_ids),
+    return _schedule_send_drafts(
+        campaign_filename,
+        ScheduleSendDraftsRequest(
+            draft_ids=request.draft_ids,
+            mode="send_now",
+            rate_per_minute=_bulk_send_rate_per_minute(),
+        ),
     )
-    return _queued_job_response(job)
 
 @router.get("/api/campaigns/{campaign_filename}/queue")
 def get_campaign_queue(campaign_filename: str) -> dict:
@@ -239,7 +228,9 @@ def get_campaign_queue(campaign_filename: str) -> dict:
         touch_number = int(draft.get("touch_number") or 1)
         enriched = _enrich_draft_queue_item(draft, total_touches)
 
-        if status in {"draft", "approved", "scheduled"} and touch_number > 1:
+        if status == "scheduled" or (
+            status in {"draft", "approved"} and touch_number > 1
+        ):
             enriched["due_label"] = "Due now"
             grouped["scheduled"].append(enriched)
         elif status == "sent":

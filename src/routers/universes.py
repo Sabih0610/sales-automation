@@ -98,6 +98,36 @@ def run_next_lead_source_segment(universe_id: str) -> dict:
     universe = lead_universe_repo.get_universe(universe_id)
     if not universe:
         raise HTTPException(status_code=404, detail="Lead universe not found")
+    if universe_id in _running_universe_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="This lead universe is already running",
+        )
+
+    if any(
+        segment.id in _running_segment_ids or segment.status == "running"
+        for segment in lead_universe_repo.list_segments(universe_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A segment in this lead universe is already running",
+        )
+
+    if universe_id in _running_universe_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="This lead universe is already running",
+        )
+
+    if any(
+        segment.id in _running_segment_ids or segment.status == "running"
+        for segment in lead_universe_repo.list_segments(universe_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A segment in this lead universe is already running",
+        )
+
     segment = lead_universe_repo.next_queued_segment(universe_id)
     if not segment:
         return {"started": False, "message": "No queued segments"}
@@ -109,12 +139,30 @@ def run_all_lead_source_segments(universe_id: str) -> dict:
     universe = lead_universe_repo.get_universe(universe_id)
     if not universe:
         raise HTTPException(status_code=404, detail="Lead universe not found")
+    if universe_id in _running_universe_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="This lead universe is already running",
+        )
+
+    segments = lead_universe_repo.list_segments(universe_id)
+    if any(
+        segment.id in _running_segment_ids or segment.status == "running"
+        for segment in segments
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A segment in this lead universe is already running",
+        )
+
     queued = [
-        segment for segment in lead_universe_repo.list_segments(universe_id)
+        segment for segment in segments
         if segment.status == "queued"
     ]
     if not queued:
         return {"started": False, "queued": 0, "message": "No queued segments"}
+
+    _running_universe_ids.add(universe_id)
     thread = threading.Thread(
         target=_run_all_segments_now,
         args=(universe_id,),

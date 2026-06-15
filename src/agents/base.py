@@ -6,6 +6,10 @@ from typing import Any, Callable
 from src.models import AgentEvent, EventType, PipelineRun
 
 
+def _error_text(exc: Exception, fallback: str = "Unknown agent error") -> str:
+    return str(exc) or repr(exc) or fallback
+
+
 class BaseAgent(ABC):
     def __init__(self, run: PipelineRun):
         self.run = run
@@ -47,7 +51,7 @@ class BaseAgent(ABC):
             )
             return result
         except Exception as exc:
-            error_message = str(exc) or repr(exc) or "Unknown agent error"
+            error_message = _error_text(exc, "Unknown agent error")
             self.emit(EventType.AGENT_FAILED, error=error_message)
             self.logger.exception("Agent failed")
             raise

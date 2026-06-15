@@ -56,6 +56,27 @@ def generate_campaign_drafts(
     )
     return _queued_job_response(job)
 
+@router.post("/api/campaigns/{campaign_filename}/drafts/schedule-approved")
+def schedule_approved_campaign_drafts(
+    campaign_filename: str,
+    request: ScheduleApprovedDraftsRequest,
+) -> dict:
+    return _schedule_approved_drafts(campaign_filename, request)
+
+@router.post("/api/campaigns/{campaign_filename}/drafts/schedule-send")
+def schedule_send_campaign_drafts(
+    campaign_filename: str,
+    request: ScheduleSendDraftsRequest,
+) -> dict:
+    return _schedule_send_drafts(campaign_filename, request)
+
+@router.post("/api/campaigns/{campaign_filename}/drafts/approve-schedule")
+def approve_schedule_campaign_drafts(
+    campaign_filename: str,
+    request: ApproveScheduleDraftsRequest,
+) -> dict:
+    return _approve_schedule_drafts(campaign_filename, request)
+
 @router.put("/api/drafts/{draft_id}")
 def update_outreach_draft(
     draft_id: str,
@@ -98,6 +119,41 @@ def update_outreach_draft(
         {"draft_id": draft.id, "fields": list(updates.keys())},
     )
     return _draft_payload(updated)
+
+@router.delete("/api/drafts/{draft_id}")
+def delete_outreach_draft(draft_id: str) -> dict:
+    draft = outreach_repo.get_draft(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if draft.status == "sent":
+        raise HTTPException(
+            status_code=400,
+            detail="Sent drafts cannot be removed",
+        )
+    if draft.status == "sending":
+        raise HTTPException(
+            status_code=409,
+            detail="Draft is currently sending and cannot be removed",
+        )
+
+    updates = {"error_message": "removed"}
+    if draft.status in {"draft", "approved", "scheduled", "failed", "skipped"}:
+        updates["status"] = "skipped"
+    updated = outreach_repo.update_draft(draft.id, updates)
+    lead = lead_repo.get_by_id(draft.lead_id)
+    _add_activity(
+        lead,
+        draft.campaign_filename,
+        "draft_removed",
+        f"Touch {draft.touch_number} draft removed",
+        "removed",
+        {"draft_id": draft.id},
+    )
+    return {
+        "removed": True,
+        "draft_id": draft.id,
+        "status": updated.status if updated else "skipped",
+    }
 
 @router.post("/api/drafts/{draft_id}/approve")
 def approve_outreach_draft(draft_id: str) -> dict:

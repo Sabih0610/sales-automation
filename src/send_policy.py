@@ -88,6 +88,10 @@ class SendPolicy:
             except ValueError:
                 pass
 
+        ramp_enabled = os.getenv("SEND_RAMP_ENABLED", "false").strip().lower() == "true"
+        if not ramp_enabled:
+            return _env_int("MAX_EMAILS_PER_DAY", 10000)
+
         age = self.account_age_days()
 
         if age <= 2:
@@ -99,27 +103,39 @@ class SendPolicy:
         if age <= 29:
             return 150
 
-        return _env_int("MAX_EMAILS_PER_DAY", 300)
+        return _env_int("MAX_EMAILS_PER_DAY", 10000)
 
     def per_domain_cap(self) -> int:
-        return _env_int("PER_DOMAIN_DAILY_CAP", 4)
+        return _env_int("PER_DOMAIN_DAILY_CAP", 10000)
 
     def send_window(self) -> dict:
+        window_enabled = os.getenv("SEND_WINDOW_ENABLED", "false").lower() == "true"
         start_raw = os.getenv("SEND_WINDOW_START", "09:00")
         end_raw = os.getenv("SEND_WINDOW_END", "17:30")
+
+        now = _karachi_now()
+        skip_weekends = os.getenv("SKIP_WEEKENDS", "false").lower() == "true"
+        is_weekend = now.weekday() >= 5
+
+        if not window_enabled:
+            return {
+                "enabled": False,
+                "start": start_raw,
+                "end": end_raw,
+                "open_now": True,
+                "timezone": "Asia/Karachi",
+                "skip_weekends": skip_weekends,
+                "is_weekend": is_weekend,
+            }
 
         start_time = _parse_hhmm(start_raw, "09:00")
         end_time = _parse_hhmm(end_raw, "17:30")
 
-        now = _karachi_now()
-        skip_weekends = os.getenv("SKIP_WEEKENDS", "true").lower() != "false"
-
-        is_weekend = now.weekday() >= 5
         in_time_window = start_time <= now.time() <= end_time
-
         open_now = in_time_window and not (skip_weekends and is_weekend)
 
         return {
+            "enabled": True,
             "start": start_raw,
             "end": end_raw,
             "open_now": open_now,
@@ -158,10 +174,14 @@ class SendPolicy:
         todays_cap = self.todays_cap()
         sent_today = send_log_repo.count_today()
 
-        if sent_today >= todays_cap:
+        daily_cap_enabled = os.getenv("DAILY_CAP_ENABLED", "true").strip().lower() == "true"
+        if daily_cap_enabled and sent_today >= todays_cap:
             return False, f"Daily cap reached ({todays_cap})"
 
-        if domain and domain not in FREE_EMAIL_DOMAINS:
+        per_domain_cap_enabled = (
+            os.getenv("PER_DOMAIN_CAP_ENABLED", "false").strip().lower() == "true"
+        )
+        if per_domain_cap_enabled and domain and domain not in FREE_EMAIL_DOMAINS:
             domain_count = send_log_repo.count_today_for_domain(domain)
             domain_cap = self.per_domain_cap()
 
@@ -190,7 +210,7 @@ class SendPolicy:
                                 False,
                                 (
                                     f"Contacted by {other_campaign} {days_ago}d ago "
-                                    "— global cooldown"
+                                    "-- global cooldown"
                                 ),
                             )
 

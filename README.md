@@ -225,3 +225,101 @@ sales automation/
 |-- .env.example
 `-- README.md
 ```
+
+
+## Production Deployment Checklist
+
+Before deploying:
+
+1. Set production mode:
+
+```text
+APP_ENV=production
+```
+
+2. Set a strong backend API key:
+
+```text
+DASHBOARD_API_KEY=<long-random-secret>
+```
+
+3. Set the same frontend key in `dashboard/.env`:
+
+```text
+VITE_API_KEY=<same-long-random-secret>
+```
+
+4. Set exact allowed dashboard origins. Do not use `*` in production:
+
+```text
+CORS_ALLOWED_ORIGINS=https://your-dashboard-domain.com
+```
+
+5. Set public URL for unsubscribe links:
+
+```text
+PUBLIC_BASE_URL=https://your-api-domain.com
+```
+
+6. Configure Microsoft Graph only when email sending is needed:
+
+```text
+AZURE_TENANT_ID=
+AZURE_CLIENT_ID=
+AZURE_CLIENT_SECRET=
+SENDER_EMAIL=
+```
+
+7. Keep scheduler enabled for automatic scheduled sending:
+
+```text
+SCHEDULER_ENABLED=true
+```
+
+8. Enable reply monitor only after Graph mailbox permissions are ready:
+
+```text
+REPLY_MONITOR_ENABLED=true
+```
+
+9. Run final backend checks:
+
+```bash
+python -m py_compile src/api.py src/storage.py src/api_helpers.py src/routers/campaigns.py
+python -c "from src.api import app; print('api app ok')"
+```
+
+10. Run final dashboard build:
+
+```bash
+cd dashboard
+npm run build
+```
+
+## Database Backup
+
+Create a safe SQLite backup while the app is stopped or running:
+
+```bash
+python scripts/backup_sqlite.py
+```
+
+By default, backups are written to:
+
+```text
+./backups
+```
+
+You can change this with:
+
+```text
+DB_BACKUP_DIR=./backups
+```
+
+SQLite production settings:
+
+```text
+SQLITE_TIMEOUT_SECONDS=30
+```
+
+The app enables WAL mode, normal synchronous mode, foreign keys, and busy timeout on SQLite connections.

@@ -185,10 +185,10 @@ export default function RunDetail() {
       <div className="run-topbar">
         <div>
           <div className="breadcrumb">
-            <Link to={`/campaigns/${encodeURIComponent(campaignFilename)}/sources`}>
+            <Link to={`/campaigns/${encodeURIComponent(campaignFilename)}/Leads`}>
               ‹ {campaignName}
             </Link>
-            <span>/ Sources / Run</span>
+            <span>/ Leads / Run</span>
           </div>
           <h1>{run.label || `Run ${id.slice(0, 8)}`}</h1>
         </div>

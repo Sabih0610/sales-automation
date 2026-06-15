@@ -222,7 +222,7 @@ class CampaignSequenceRules:
     stop_on_bounce: bool = True
     stop_on_unsubscribe: bool = True
     skip_no_email: bool = True
-    skip_weekends: bool = True
+    skip_weekends: bool = False
     send_window_start: str = "09:00"
     send_window_end: str = "17:00"
     daily_send_limit: int = 50

@@ -1,3 +1,13 @@
+from src.stale_run_recovery import recover_stale_running_runs
+import asyncio
+import sys
+
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
 import asyncio
 import logging
 import os
@@ -18,21 +28,50 @@ from src.campaign_importer import import_campaign_seed_files_once
 from src.job_worker import get_job_worker
 from src.routers import campaigns, drafts, leads, public, queue, runs, settings, universes
 from src.scheduler import run_scheduler_loop
-from src.storage import event_repo, job_repo, run_repo
+from src.storage import event_repo, job_repo, outreach_repo, run_repo
 
 
 logger = logging.getLogger(__name__)
 send_policy_status = settings.send_policy_status
 inbox_monitor_status = settings.inbox_monitor_status
 
-_DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY", "").strip()
+def _is_production_env() -> bool:
+    value = (
+        os.getenv("APP_ENV", "")
+        or os.getenv("ENVIRONMENT", "")
+        or os.getenv("FASTAPI_ENV", "")
+    ).strip().lower()
+    return value in {"prod", "production"}
 
-if not _DASHBOARD_API_KEY:
-    _DASHBOARD_API_KEY = secrets.token_urlsafe(32)
-    logger.critical(
-        "DASHBOARD_API_KEY is missing. Generated temporary development key: %s",
-        _DASHBOARD_API_KEY,
+
+def _load_dashboard_api_key() -> str:
+    api_key = os.getenv("DASHBOARD_API_KEY", "").strip()
+
+    if api_key:
+        if len(api_key) < 24:
+            message = (
+                "DASHBOARD_API_KEY is too short. Use at least 24 characters."
+            )
+            if _is_production_env():
+                raise RuntimeError(message)
+            logger.warning(message)
+        return api_key
+
+    if _is_production_env():
+        raise RuntimeError(
+            "DASHBOARD_API_KEY is required when APP_ENV=production "
+            "or ENVIRONMENT=production."
+        )
+
+    generated_key = secrets.token_urlsafe(32)
+    logger.warning(
+        "DASHBOARD_API_KEY is missing. Generated a temporary development key. "
+        "Set DASHBOARD_API_KEY in .env for stable dashboard access."
     )
+    return generated_key
+
+
+_DASHBOARD_API_KEY = _load_dashboard_api_key()
 
 
 async def require_api_key(x_api_key: str = Header(default="")) -> None:
@@ -51,11 +90,16 @@ def _cors_allowed_origins() -> list[str]:
     raw = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
 
     if raw:
-        return [
+        origins = [
             origin.strip().rstrip("/")
             for origin in raw.split(",")
             if origin.strip()
         ]
+        if _is_production_env() and "*" in origins:
+            raise RuntimeError(
+                "CORS_ALLOWED_ORIGINS cannot contain '*' in production."
+            )
+        return origins
 
     return [
         "http://localhost:3000",
@@ -159,6 +203,12 @@ def startup() -> None:
     import_campaign_seed_files_once()
 
     job_repo.reset_stale_running_to_failed_on_startup()
+    reset_drafts = outreach_repo.reset_stale_sending_to_failed_on_startup()
+    if reset_drafts:
+        logger.warning(
+            "Reset %s interrupted sending drafts to failed on startup",
+            reset_drafts,
+        )
     job_worker = get_job_worker()
     app.state.job_worker = job_worker
     job_worker.start()
@@ -241,3 +291,8 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("src.api:app", host="0.0.0.0", port=8000, reload=True)
+
+@app.on_event("startup")
+def _recover_stale_running_runs_on_startup() -> None:
+    recover_stale_running_runs()
+

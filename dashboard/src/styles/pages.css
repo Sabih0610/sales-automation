@@ -992,6 +992,7 @@ button.metric-card:hover {
   color: var(--green);
 }
 .badge.scheduled,
+.badge.sending,
 .badge.followup-due {
   background: var(--amber-light);
   color: var(--amber);

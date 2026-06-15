@@ -76,6 +76,11 @@ export default function ReportsTab({ filename }) {
 
   const totals = report?.totals || {
     sent: 0,
+    drafts: 0,
+    scheduled: 0,
+    sending: 0,
+    failed: 0,
+    skipped: 0,
     replies: 0,
     bounces: 0,
     unsubscribes: 0,
@@ -134,6 +139,10 @@ export default function ReportsTab({ filename }) {
         <>
           <div className="report-metric-grid">
             <Metric label="Sent" value={totals.sent || 0} />
+            <Metric label="Draft/approved" value={totals.drafts || 0} />
+            <Metric label="Scheduled" value={totals.scheduled || 0} />
+            <Metric label="Sending" value={totals.sending || 0} />
+            <Metric label="Failed" value={totals.failed || 0} />
             <Metric label="Replies" value={totals.replies || 0} />
             <Metric label="Reply rate" value={totals.reply_rate || 0} suffix="%" />
             <Metric label="Bounces" value={totals.bounces || 0} />

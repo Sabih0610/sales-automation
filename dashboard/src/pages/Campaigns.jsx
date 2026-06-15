@@ -4,6 +4,7 @@ import {
   useCampaignOverview,
   useCampaigns,
   useCreateCampaign,
+  useDeleteCampaign,
   useKnowledgeBases,
   useUploadKnowledgeBase,
 } from "../queries"
@@ -26,21 +27,45 @@ const statItems = [
   ["followups_due", "Due"],
 ]
 
-function CampaignCard({ campaign, onOpen }) {
+function CampaignCard({ campaign, deleting, onDelete, onOpen }) {
   const { data: stats = emptyStats } = useCampaignOverview(campaign.filename)
 
+  const handleKeyDown = (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault()
+      onOpen()
+    }
+  }
+
   return (
-    <button
-      type="button"
+    <article
       className="campaign-card"
       onClick={onOpen}
+      onKeyDown={handleKeyDown}
+      role="button"
+      tabIndex={0}
     >
       <div className="campaign-card-head">
         <div>
           <h2>{campaign.name}</h2>
           <p>{campaign.description || "Campaign workspace"}</p>
         </div>
-        <span className="badge completed">Active</span>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span className="badge completed">Active</span>
+          <button
+            aria-label={`Delete campaign ${campaign.name}`}
+            className="btn icon"
+            disabled={deleting}
+            onClick={(event) => {
+              event.stopPropagation()
+              onDelete(campaign)
+            }}
+            title="Delete campaign"
+            type="button"
+          >
+            <i className="ti ti-trash" aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
       <div className="campaign-stat-grid">
@@ -69,7 +94,7 @@ function CampaignCard({ campaign, onOpen }) {
         <span>Open workspace</span>
         <i className="ti ti-arrow-right" aria-hidden="true" />
       </div>
-    </button>
+    </article>
   )
 }
 
@@ -78,6 +103,7 @@ export default function Campaigns() {
   const { data: campaigns = [] } = useCampaigns()
   const { data: kbFiles = [] } = useKnowledgeBases()
   const createCampaignMutation = useCreateCampaign()
+  const deleteCampaignMutation = useDeleteCampaign()
   const uploadKnowledgeBaseMutation = useUploadKnowledgeBase()
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState({
@@ -95,6 +121,20 @@ export default function Campaigns() {
   const [uploadKbResult, setUploadKbResult] = useState(null)
   const saving = createCampaignMutation.isPending
   const uploadingKb = uploadKnowledgeBaseMutation.isPending
+
+  const handleDeleteCampaign = async (campaign) => {
+    const confirmed = window.confirm(
+      `Delete campaign "${campaign.name}" and all related leads, drafts, sequences, reports, scrape history, and jobs? This cannot be undone.`,
+    )
+    if (!confirmed) return
+
+    setError("")
+    try {
+      await deleteCampaignMutation.mutateAsync(campaign.filename)
+    } catch (err) {
+      setError(err.response?.data?.detail || "Failed to delete campaign")
+    }
+  }
 
   const toggleKb = (filename) => {
     setForm(f => ({
@@ -200,7 +240,9 @@ export default function Campaigns() {
           {campaigns.map(c => (
             <CampaignCard
               campaign={c}
+              deleting={deleteCampaignMutation.isPending}
               key={c.filename}
+              onDelete={handleDeleteCampaign}
               onOpen={() => navigate(`/campaigns/${encodeURIComponent(c.filename)}`)}
             />
           ))}

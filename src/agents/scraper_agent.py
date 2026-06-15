@@ -8,7 +8,7 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext
 from src.agents.base import BaseAgent
 from src.config import settings
 from src.models import EventType, Lead, LeadStatus, PipelineRun, Segment
-from src.storage import run_repo
+from src.storage import run_repo, lead_repo
 
 
 def safe_str(value) -> str:
@@ -26,6 +26,53 @@ def safe_str(value) -> str:
             safe_str(v) for v in value.values() if safe_str(v)
         ).strip()
     return str(value).strip()
+
+
+
+_PLACEHOLDER_DETAIL_VALUES = {
+    "",
+    "-",
+    "--",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "unknown",
+    "no details",
+    "no detail",
+    "details unavailable",
+    "profile unavailable",
+    "private profile",
+    "linkedin member",
+    "linkedin user",
+    "view profile",
+    "name unavailable",
+}
+
+
+def _is_placeholder_detail(value) -> bool:
+    text = safe_str(value).strip().lower()
+    return text in _PLACEHOLDER_DETAIL_VALUES
+
+
+def _has_sales_nav_useful_details(
+    name: str,
+    title: str,
+    company: str,
+    location: str,
+    href: str,
+    company_url: str,
+) -> bool:
+    if _is_placeholder_detail(name):
+        return False
+
+    return any(
+        safe_str(value) and not _is_placeholder_detail(value)
+        for value in (title, company, location, href, company_url)
+    )
+
+def _error_text(exc: Exception, fallback: str = "Unknown scraper error") -> str:
+    return str(exc) or repr(exc) or fallback
 
 
 class _BrowserAgent:
@@ -303,7 +350,10 @@ PAGE TEXT:
                     f"JSON parse error in chunk: {e}"
                 )
             except Exception as e:
-                self.logger.warning(f"OpenAI error: {e}")
+                self.logger.warning(
+                    "OpenAI error: %s",
+                    _error_text(e, "Unknown OpenAI extraction error"),
+                )
 
         self.logger.info(
             f"ExtractorAgent: {len(all_items)} raw items extracted"
@@ -536,7 +586,7 @@ class _StorageAgent:
                 self.logger.warning(
                     "Duplicate detection failed for lead %s: %s",
                     lead.id,
-                    exc,
+                    _error_text(exc, "Unknown duplicate detection error"),
                 )
 
 
@@ -606,7 +656,11 @@ class ScraperAgent(BaseAgent):
                 else:
                     json.dump(data, f, indent=2, default=str, ensure_ascii=False)
         except Exception as exc:
-            self.logger.warning(f"Debug write failed for {filename}: {exc}")
+            self.logger.warning(
+                "Debug write failed for %s: %s",
+                filename,
+                _error_text(exc, "Unknown debug write error"),
+            )
 
     def _write_page_error(self, page_num: int, raw_text: str, exc: Exception) -> None:
         raw_response = getattr(self._extractor, "last_raw_response", "")
@@ -614,7 +668,7 @@ class ScraperAgent(BaseAgent):
             f"page_{page_num:03d}_error.txt",
             "\n".join([
                 "EXCEPTION:",
-                str(exc),
+                _error_text(exc, "Unknown page processing error"),
                 "",
                 "TRACEBACK:",
                 traceback.format_exc(),
@@ -984,7 +1038,10 @@ class ScraperAgent(BaseAgent):
             merged["company"] = company
             return merged
         except Exception as exc:
-            self.logger.warning(f"SalesNav OpenAI repair failed: {exc}")
+            self.logger.warning(
+                "SalesNav OpenAI repair failed: %s",
+                _error_text(exc, "Unknown SalesNav repair error"),
+            )
             return parsed
 
     def _write_sales_nav_debug_jsonl(
@@ -1012,7 +1069,10 @@ class ScraperAgent(BaseAgent):
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         except Exception as exc:
-            self.logger.warning(f"SalesNav debug JSONL write failed: {exc}")
+            self.logger.warning(
+                "SalesNav debug JSONL write failed: %s",
+                _error_text(exc, "Unknown SalesNav debug write error"),
+            )
 
     def _split_sales_nav_title_company(self, value: str) -> tuple[str, str]:
         value = self._strip_sales_nav_experience_prefix(value)
@@ -1553,7 +1613,10 @@ class ScraperAgent(BaseAgent):
                 """
             ) or []
         except Exception as exc:
-            self.logger.warning(f"Sales Navigator DOM evaluate failed: {exc}")
+            self.logger.warning(
+                "Sales Navigator DOM evaluate failed: %s",
+                _error_text(exc, "Unknown Sales Navigator DOM error"),
+            )
             return []
 
     def _scroll_sales_nav_results(self, page: Page) -> None:
@@ -1697,7 +1760,8 @@ el => Boolean(
                 return True
         except Exception as exc:
             self.logger.warning(
-                f"Sales Navigator next page JS fallback failed: {exc}"
+                "Sales Navigator next page JS fallback failed: %s",
+                _error_text(exc, "Unknown Sales Navigator pagination error"),
             )
 
         if saw_disabled_next:
@@ -1711,6 +1775,61 @@ el => Boolean(
                 "No next page found. Stopping Sales Navigator pagination."
             )
         return False
+
+    def _raise_if_stop_requested(self) -> None:
+        try:
+            if run_repo.get_control(self.run.id) == "stop":
+                self.logger.warning("Stop requested by user. Stopping scraper.")
+                raise RuntimeError("Run stopped by user.")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "Could not check run control state: %s",
+                _error_text(exc, "Unknown run control error"),
+            )
+
+    def _sales_nav_rate_limit_message(self, page: Page) -> str:
+        try:
+            text = safe_str(page.evaluate(
+                """() => `${document.title || ""}\n${document.body ? document.body.innerText : ""}`"""
+            )).lower()
+        except Exception:
+            return ""
+
+        markers = (
+            "too many requests",
+            "you've made too many requests",
+            "try again later",
+            "rate limit",
+        )
+        if any(marker in text for marker in markers):
+            return (
+                "LinkedIn Sales Navigator rate limit detected: Too Many Requests. "
+                "Scraping paused to avoid further requests. Retry later."
+            )
+        return ""
+
+    def _raise_if_sales_nav_rate_limited(self, page: Page) -> None:
+        message = self._sales_nav_rate_limit_message(page)
+        if not message:
+            return
+        self._sales_nav_stop_reason = "rate_limited"
+        self.emit(EventType.AGENT_FAILED, {
+            "status": "rate_limited",
+            "message": message,
+        })
+        raise RuntimeError(message)
+
+    def _sales_nav_scroll_delay(self) -> None:
+        minimum = float(os.getenv("SALES_NAV_SCROLL_DELAY_MIN", "4"))
+        maximum = float(os.getenv("SALES_NAV_SCROLL_DELAY_MAX", "8"))
+        time.sleep(random.uniform(minimum, max(minimum, maximum)))
+
+    def _sales_nav_page_delay(self) -> None:
+        minimum = float(os.getenv("SALES_NAV_PAGE_DELAY_MIN", "45"))
+        maximum = float(os.getenv("SALES_NAV_PAGE_DELAY_MAX", "90"))
+        time.sleep(random.uniform(minimum, max(minimum, maximum)))
 
     def _scrape_sales_navigator(self, page: Page, max_leads: int) -> list[Lead]:
         self._sales_nav_stop_reason = "unknown"
@@ -1730,7 +1849,10 @@ el => Boolean(
             with open(debug_path, "w", encoding="utf-8"):
                 pass
         except Exception as exc:
-            self.logger.warning(f"SalesNav debug JSONL init failed: {exc}")
+            self.logger.warning(
+                "SalesNav debug JSONL init failed: %s",
+                _error_text(exc, "Unknown SalesNav debug init error"),
+            )
 
         try:
             page.wait_for_load_state("domcontentloaded", timeout=60000)
@@ -1750,6 +1872,7 @@ el => Boolean(
                 "Timed out waiting for Sales Navigator lead anchors. "
                 "Confirm the browser is logged in and results are visible."
             )
+        self._raise_if_sales_nav_rate_limited(page)
 
         leads: list[Lead] = []
         seen_urls: set[str] = set()
@@ -1757,10 +1880,51 @@ el => Boolean(
         seen_name_title_location: set[str] = set()
         max_empty_rounds = 5
         page_number = 1
+        last_saved_count = 0
+
+        resume_from_checkpoint = bool(self.filters.get("resume_from_checkpoint"))
+        checkpoint = run_repo.get_checkpoint(self.run.id) if resume_from_checkpoint else None
+        start_page = int(self.filters.get("start_page") or 1)
+
+        if checkpoint:
+            start_page = max(start_page, int(checkpoint.get("last_page") or 0) + 1)
+
+        batch_page_limit = int(
+            self.filters.get("batch_page_limit")
+            or os.getenv("SCRAPER_BATCH_PAGE_LIMIT", "0")
+            or 0
+        )
+
         max_pages = max(10, math.ceil(max_leads / 20) + 3)
+        if batch_page_limit > 0:
+            max_pages = min(max_pages, start_page + batch_page_limit - 1)
+
         no_new_page_count = 0
 
+        if start_page > 1:
+            self.logger.info(f"Resuming Sales Navigator scrape from page {start_page}.")
+            self.emit(EventType.LEAD_SCRAPED, {
+                "status": "resume",
+                "page": start_page,
+                "message": f"Resuming from checkpoint page {start_page}.",
+            })
+
+            while page_number < start_page:
+                if not self._click_sales_nav_next_page(page):
+                    self._sales_nav_stop_reason = (
+                        self._sales_nav_last_next_failure or "resume_next_failed"
+                    )
+                    self.logger.warning(
+                        f"Could not advance to resume page {start_page}. "
+                        f"Stopped at page {page_number}."
+                    )
+                    return leads
+                page_number += 1
+                time.sleep(random.uniform(0.75, 1.5))
+
         while len(leads) < max_leads and page_number <= max_pages:
+            self._raise_if_stop_requested()
+            self._raise_if_sales_nav_rate_limited(page)
             self.logger.info(f"Sales Navigator page {page_number} started.")
             page_start_total = len(leads)
             empty_rounds = 0
@@ -1781,6 +1945,7 @@ el => Boolean(
                 len(leads) < max_leads
                 and empty_rounds < max_empty_rounds
             ):
+                self._raise_if_stop_requested()
                 scroll_rounds += 1
                 visible_cards = self._visible_sales_nav_cards(page)
                 new_this_round = 0
@@ -1834,7 +1999,33 @@ el => Boolean(
                     if company_url and company_url.startswith("/"):
                         company_url = f"https://www.linkedin.com{company_url}"
                     company_url = company_url.split("?")[0].rstrip("/")
+
+                    if _is_placeholder_detail(name):
+                        name = ""
+                    if _is_placeholder_detail(title):
+                        title = ""
+                    if _is_placeholder_detail(company):
+                        company = ""
+                    if _is_placeholder_detail(location):
+                        location = ""
+
                     if not name or len(name) < 2:
+                        continue
+
+                    if not _has_sales_nav_useful_details(
+                        name,
+                        title,
+                        company,
+                        location,
+                        href,
+                        company_url,
+                    ):
+                        self.logger.warning(
+                            "Skipping Sales Navigator card with no usable "
+                            f"details: name={name!r}, title={title!r}, "
+                            f"company={company!r}, location={location!r}, "
+                            f"href={href!r}"
+                        )
                         continue
 
                     url_key = href.lower()
@@ -1934,11 +2125,8 @@ el => Boolean(
                         "page": page_number,
                     })
 
-                run_repo.update_checkpoint(
-                    run_id=self.run.id,
-                    last_page=page_number,
-                    leads_collected=len(leads),
-                )
+                # Do not checkpoint inside a scroll round.
+                # Checkpoint is saved only after the page's leads are persisted to DB.
 
                 if new_this_round == 0:
                     empty_rounds += 1
@@ -1949,13 +2137,35 @@ el => Boolean(
                     break
 
                 self._scroll_sales_nav_results(page)
-                time.sleep(random.uniform(1.5, 2.5))
+                self._sales_nav_scroll_delay()
 
             page_new = len(leads) - page_start_total
             self.logger.info(
                 f"Sales Navigator page {page_number} collected "
                 f"{page_new} new leads. Total {len(leads)}."
             )
+
+            if len(leads) > last_saved_count:
+                new_leads = leads[last_saved_count:]
+                lead_repo.save_batch(self.run.id, new_leads)
+                last_saved_count = len(leads)
+                self.run.total_scraped = len(leads)
+                run_repo.save(self.run)
+                run_repo.update_checkpoint(
+                    run_id=self.run.id,
+                    last_page=page_number,
+                    leads_collected=len(leads),
+                )
+                self.logger.info(
+                    f"Checkpoint saved: page {page_number}, "
+                    f"{len(leads)} leads persisted."
+                )
+                self.emit(EventType.LEAD_SCRAPED, {
+                    "status": "checkpoint_saved",
+                    "page": page_number,
+                    "total_so_far": len(leads),
+                    "message": f"Saved checkpoint at page {page_number}.",
+                })
 
             if len(leads) >= max_leads:
                 self._sales_nav_stop_reason = "max_leads_reached"
@@ -1984,6 +2194,8 @@ el => Boolean(
                     self._sales_nav_last_next_failure or "no_next_button"
                 )
                 break
+            self._raise_if_sales_nav_rate_limited(page)
+            self._sales_nav_page_delay()
 
             after_signature = ""
             update_deadline = time.time() + 10
@@ -2155,10 +2367,12 @@ el => Boolean(
                 )
                 return formatted
             except Exception as exc:
+                error_message = _error_text(exc, "Unknown extraction error")
                 self.logger.exception(
-                    f"Phase 2 extraction failed for page {page_num}: {exc}"
+                    "Phase 2 extraction failed for page %s: %s",
+                    page_num,
+                    error_message,
                 )
-                error_message = str(exc) or repr(exc) or "Unknown extraction error"
                 self.emit(
                     EventType.AGENT_FAILED,
                     payload={
@@ -2259,7 +2473,10 @@ el => Boolean(
                         )
                         break
                     except Exception as cdp_exc:
-                        last_cdp_error = str(cdp_exc) or repr(cdp_exc)
+                        last_cdp_error = _error_text(
+                            cdp_exc,
+                            "Unknown Chrome CDP connection error",
+                        )
                         self.logger.warning(
                             f"CDP connect attempt {attempt + 1}/5 failed: "
                             f"{last_cdp_error}"
@@ -2356,6 +2573,7 @@ el => Boolean(
             self._seen_hashes.add(first_hash)
 
             while page_num <= estimated_pages:
+                self._raise_if_stop_requested()
                 raw_text = self._browser_agent.wait_for_content(page)
                 if raw_text:
                     self._raw_pages.append(raw_text)
@@ -2430,10 +2648,12 @@ el => Boolean(
                 )
                 return formatted
             except Exception as exc:
+                error_message = _error_text(exc, "Unknown extraction error")
                 self.logger.exception(
-                    f"Phase 2 extraction failed for page {page_num}: {exc}"
+                    "Phase 2 extraction failed for page %s: %s",
+                    page_num,
+                    error_message,
                 )
-                error_message = str(exc) or repr(exc) or "Unknown extraction error"
                 self.emit(
                     EventType.AGENT_FAILED,
                     payload={
