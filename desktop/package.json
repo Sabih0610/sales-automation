@@ -3,17 +3,97 @@
   "version": "0.1.0",
   "private": true,
   "description": "Electron desktop shell for the Royal Cyber Lead Pipeline dashboard.",
+  "author": "Royal Cyber",
   "main": "main.js",
   "scripts": {
     "build:backend": "powershell -ExecutionPolicy Bypass -File ../scripts/build_backend_exe.ps1",
+    "build:desktop": "npm run verify:release-inputs && node scripts/build-desktop-release.js nsis portable",
+    "build:desktop:installer": "npm run verify:release-inputs && node scripts/build-desktop-release.js nsis",
+    "build:desktop:portable": "npm run verify:release-inputs && node scripts/build-desktop-release.js portable",
     "build:dashboard": "node scripts/build-dashboard.js",
     "dev": "node scripts/start-electron.js --dev",
+    "dist": "npm run release",
     "prod": "npm run build:dashboard && npm run start:built",
+    "release": "npm run build:dashboard && npm run build:backend && npm run build:desktop",
     "start": "node scripts/start-electron.js --built",
     "start:built": "node scripts/start-electron.js --built",
-    "start:dev": "node scripts/start-electron.js --dev"
+    "start:dev": "node scripts/start-electron.js --dev",
+    "verify:release-inputs": "node scripts/verify-release-inputs.js"
+  },
+  "build": {
+    "appId": "com.royalcyber.leadpipeline",
+    "productName": "Royal Cyber Lead Pipeline",
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "asar": true,
+    "files": [
+      "main.js",
+      "package.json",
+      "assets/icon.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "../dashboard/dist",
+        "to": "dashboard/dist",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../dist/royal-cyber-backend",
+        "to": "backend/royal-cyber-backend",
+        "filter": [
+          "**/*",
+          "!**/.env",
+          "!**/*.db",
+          "!**/*.db-shm",
+          "!**/*.db-wal",
+          "!**/*.sqlite",
+          "!**/*.sqlite3",
+          "!**/*.log",
+          "!**/debug/**",
+          "!**/logs/**",
+          "!**/output/**"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "assets/icon.ico",
+      "forceCodeSigning": false,
+      "signExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Royal Cyber Lead Pipeline"
+    },
+    "portable": {
+      "artifactName": "Royal Cyber Lead Pipeline Portable ${version}.${ext}"
+    },
+    "publish": null
   },
   "devDependencies": {
-    "electron": "40.10.2"
+    "electron": "40.10.2",
+    "electron-builder": "^26.15.3"
   }
 }

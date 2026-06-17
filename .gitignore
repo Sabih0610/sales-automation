@@ -12,6 +12,7 @@ debug/
 dashboard/node_modules/
 desktop/node_modules/
 desktop/logs/
+desktop/release/
 dashboard/dist/
 build/
 dist/

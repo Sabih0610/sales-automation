@@ -193,6 +193,56 @@ dashboard uses `http://127.0.0.1:8000` for API requests and
 running production desktop mode. To point development desktop mode at a
 different dashboard URL, set `RCLP_DASHBOARD_URL` before running `npm run dev`.
 
+### Windows Release Build
+
+Install desktop packaging dependencies once:
+
+```bash
+cd desktop
+npm install
+```
+
+Create a full Windows release build from the desktop package:
+
+```bash
+cd desktop
+npm run release
+```
+
+This command builds the dashboard, rebuilds the backend executable, verifies
+release inputs, then creates both Windows targets with electron-builder:
+
+- NSIS installer
+- Portable executable
+
+Release artifacts are written to:
+
+```text
+desktop/release/
+```
+
+To build only the installer after the dashboard and backend exe already exist:
+
+```bash
+cd desktop
+npm run build:desktop:installer
+```
+
+To build only the portable executable:
+
+```bash
+cd desktop
+npm run build:desktop:portable
+```
+
+The portable build can be launched directly from `desktop/release/`. The
+installed and portable apps both load the production dashboard files and start
+the packaged backend executable automatically. No Python or Vite dev server is
+required for these builds.
+
+See `docs/desktop_release_checklist.md` before publishing or handing off a
+desktop build.
+
 ### Desktop App Data
 
 Production desktop mode stores runtime data outside the app folder at:

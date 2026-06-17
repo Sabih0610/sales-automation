@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Royal Cyber Lead Pipeline">
+  <defs>
+    <linearGradient id="bg" x1="72" y1="56" x2="440" y2="456" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#123a5d"/>
+      <stop offset="0.52" stop-color="#0f766e"/>
+      <stop offset="1" stop-color="#6b4f1d"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="url(#bg)"/>
+  <path d="M136 316h56c28 0 50-22 50-50s-22-50-50-50h-56v100Zm0 72V124h70c68 0 110 55 94 113-7 27-26 49-51 61l69 90h-76l-61-82h-45v82h-60Z" fill="#ffffff"/>
+  <path d="M323 324c-32 0-56-23-56-56s24-56 56-56c26 0 47 14 55 36l-51 15c-2-8-8-13-16-13-13 0-21 9-21 18s8 18 21 18c8 0 14-5 16-13l51 15c-8 22-29 36-55 36Z" fill="#ffffff"/>
+  <path d="M151 420h210c21 0 38-17 38-38v-20h-48v10H161v-10h-48v20c0 21 17 38 38 38Z" fill="#f4c542"/>
+</svg>

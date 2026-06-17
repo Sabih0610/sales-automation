@@ -12,9 +12,6 @@ const BACKEND_API_BASE = process.env.RCLP_API_BASE || "http://127.0.0.1:8000"
 const BACKEND_WS_BASE = process.env.RCLP_WS_BASE || "ws://127.0.0.1:8000"
 const BACKEND_START_TIMEOUT_MS = Number(process.env.RCLP_BACKEND_START_TIMEOUT_MS || 60000)
 const PROJECT_ROOT = path.resolve(__dirname, "..")
-const DASHBOARD_DIST_INDEX = path.join(PROJECT_ROOT, "dashboard", "dist", "index.html")
-const PACKAGED_BACKEND_EXE = process.env.RCLP_BACKEND_EXE ||
-  path.join(PROJECT_ROOT, "dist", "royal-cyber-backend", "royal-cyber-backend.exe")
 const DESKTOP_MODE = (process.env.RCLP_DESKTOP_MODE || "built").trim().toLowerCase()
 const APP_DATA_FOLDER_NAME = "RoyalCyberLeadPipeline"
 
@@ -34,6 +31,49 @@ function isDevDashboardMode() {
 
 function isBuiltDashboardMode() {
   return !isDevDashboardMode()
+}
+
+function packagedResourcesRoot() {
+  return app.isPackaged ? process.resourcesPath : PROJECT_ROOT
+}
+
+function dashboardDistIndexPath() {
+  const configured = (process.env.RCLP_DASHBOARD_DIST_INDEX || "").trim()
+  if (configured) {
+    return configured
+  }
+
+  if (app.isPackaged) {
+    return path.join(packagedResourcesRoot(), "dashboard", "dist", "index.html")
+  }
+  return path.join(PROJECT_ROOT, "dashboard", "dist", "index.html")
+}
+
+function packagedBackendExePath() {
+  const configured = (process.env.RCLP_BACKEND_EXE || "").trim()
+  if (configured) {
+    return configured
+  }
+
+  if (app.isPackaged) {
+    return path.join(
+      packagedResourcesRoot(),
+      "backend",
+      "royal-cyber-backend",
+      "royal-cyber-backend.exe",
+    )
+  }
+  return path.join(
+    PROJECT_ROOT,
+    "dist",
+    "royal-cyber-backend",
+    "royal-cyber-backend.exe",
+  )
+}
+
+function appIconPath() {
+  const candidate = path.join(__dirname, "assets", "icon.ico")
+  return fs.existsSync(candidate) ? candidate : undefined
 }
 
 function desktopAppDataDir() {
@@ -120,6 +160,29 @@ function backendLogPath() {
   }
   return path.join(__dirname, "logs", "backend.log")
 }
+
+function appendDesktopLog(message) {
+  const line = `[${new Date().toISOString()}] ${message}\n`
+  try {
+    const logPath = path.join(path.dirname(backendLogPath()), "desktop.log")
+    fs.mkdirSync(path.dirname(logPath), { recursive: true })
+    fs.appendFileSync(logPath, line)
+  } catch {
+    // Logging must never prevent app startup.
+  }
+}
+
+process.on("uncaughtException", (error) => {
+  appendDesktopLog(`Uncaught exception: ${error.stack || error.message || error}`)
+})
+
+process.on("unhandledRejection", (error) => {
+  appendDesktopLog(`Unhandled rejection: ${error?.stack || error?.message || error}`)
+})
+
+appendDesktopLog(
+  `Desktop main loaded. packaged=${app.isPackaged} resources=${process.resourcesPath || ""}`,
+)
 
 function isDashboardUrl(url) {
   try {
@@ -231,18 +294,19 @@ function backendLaunchConfig() {
     }
   }
 
-  if (!fs.existsSync(PACKAGED_BACKEND_EXE)) {
+  const packagedBackendExe = packagedBackendExePath()
+  if (!fs.existsSync(packagedBackendExe)) {
     throw new Error(
-      `Packaged backend executable not found at ${PACKAGED_BACKEND_EXE}. Run "scripts\\build_backend_exe.ps1" first.`,
+      `Packaged backend executable not found at ${packagedBackendExe}. Run "scripts\\build_backend_exe.ps1" first.`,
     )
   }
 
-  let runtimeExe = PACKAGED_BACKEND_EXE
+  let runtimeExe = packagedBackendExe
   const preparedRuntimeDir = process.env.RCLP_BACKEND_RUNTIME_DIR || ""
   if (preparedRuntimeDir) {
     backendRuntimeDir = preparedRuntimeDir
   } else {
-    const sourceDir = path.dirname(PACKAGED_BACKEND_EXE)
+    const sourceDir = path.dirname(packagedBackendExe)
     const runtimeBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "rclp-backend-"))
     const runtimeDir = path.join(runtimeBaseDir, "royal-cyber-backend")
     runtimeExe = path.join(runtimeDir, "royal-cyber-backend.exe")
@@ -253,7 +317,7 @@ function backendLaunchConfig() {
   return {
     command: runtimeExe,
     args: [],
-    cwd: PROJECT_ROOT,
+    cwd: app.isPackaged ? packagedResourcesRoot() : PROJECT_ROOT,
     label: runtimeExe,
   }
 }
@@ -444,6 +508,7 @@ function createBackendErrorWindow(details) {
     minWidth: 720,
     minHeight: 520,
     title: "Royal Cyber Lead Pipeline",
+    icon: appIconPath(),
     backgroundColor: "#f8fafc",
     autoHideMenuBar: true,
     webPreferences: {
@@ -465,6 +530,7 @@ function createWindow() {
     minWidth: 1100,
     minHeight: 720,
     title: "Royal Cyber Lead Pipeline",
+    icon: appIconPath(),
     backgroundColor: "#f8fafc",
     autoHideMenuBar: true,
     webPreferences: {
@@ -499,13 +565,14 @@ function createWindow() {
     return
   }
 
-  if (!fs.existsSync(DASHBOARD_DIST_INDEX)) {
+  const dashboardDistIndex = dashboardDistIndexPath()
+  if (!fs.existsSync(dashboardDistIndex)) {
     throw new Error(
-      `Built dashboard not found at ${DASHBOARD_DIST_INDEX}. Run "cd dashboard && npm run build" first.`,
+      `Built dashboard not found at ${dashboardDistIndex}. Run "cd dashboard && npm run build" first.`,
     )
   }
 
-  mainWindow.loadFile(DASHBOARD_DIST_INDEX, {
+  mainWindow.loadFile(dashboardDistIndex, {
     query: {
       apiBase: BACKEND_API_BASE,
       wsBase: BACKEND_WS_BASE,
