@@ -2246,6 +2246,327 @@ el => Boolean(
         )
         return leads
 
+    _SALESNAV_SEARCH_HINTS = (
+        "salesapileadsearch",
+        "salesapipeoplesearch",
+        "leadsearch",
+        "peoplesearch",
+        "sales-api",
+    )
+
+    def _capture_salesnav_payload(self, page, trigger):
+        # Attach a response listener, run the trigger (goto / next click), and
+        # return the search JSON payload with the most leads, or None.
+        bucket = []
+        state = {"auth_or_rate": False}
+        extract = getattr(self, "_extract_salesnav", None)
+
+        def handler(response):
+            try:
+                url = safe_str(getattr(response, "url", "")).lower()
+                if not any(hint in url for hint in self._SALESNAV_SEARCH_HINTS):
+                    return
+                try:
+                    status = int(response.status)
+                except Exception:
+                    status = 0
+                if status in (401, 403, 429):
+                    state["auth_or_rate"] = True
+                    return
+                ctype = safe_str((response.headers or {}).get("content-type", "")).lower()
+                if "json" not in ctype:
+                    return
+                bucket.append(response.json())
+            except Exception:
+                pass
+
+        try:
+            page.on("response", handler)
+        except Exception:
+            return None, False, False
+
+        triggered = False
+        try:
+            result = trigger()
+            triggered = True if result is None else bool(result)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(2.0)
+        except Exception as exc:
+            self.logger.warning(
+                "SalesNav capture trigger failed: %s",
+                _error_text(exc, "Unknown capture error"),
+            )
+            triggered = False
+        finally:
+            try:
+                page.remove_listener("response", handler)
+            except Exception:
+                pass
+
+        best = None
+        best_n = -1
+        for body in bucket:
+            try:
+                n = len(extract(body)) if extract else 0
+            except Exception:
+                n = 0
+            if n > best_n:
+                best_n = n
+                best = body
+        if best is not None:
+            try:
+                self._salesnav_api_dump = getattr(self, "_salesnav_api_dump", 0) + 1
+                self._write_debug(f"salesnav_api_{self._salesnav_api_dump:03d}.json", best)
+            except Exception:
+                pass
+        return best, triggered, state["auth_or_rate"]
+
+    def _ingest_salesnav_record(self, rec, leads, seen_urls, seen_name_company, seen_name_title_location):
+        name = safe_str(rec.get("full_name"))
+        if not name or len(name) < 2:
+            return False
+        title = safe_str(rec.get("title"))
+        company = safe_str(rec.get("company"))
+        location = safe_str(rec.get("location"))
+        href = safe_str(rec.get("linkedin_url")).split("?")[0].rstrip("/")
+        first = safe_str(rec.get("first_name"))
+        last = safe_str(rec.get("last_name"))
+
+        url_key = href.lower()
+        name_company_key = f"{name.lower()}|{company.lower()}"
+        name_title_location_key = f"{name.lower()}|{title.lower()}|{location.lower()}"
+        if url_key and url_key in seen_urls:
+            return False
+        if company and name_company_key in seen_name_company:
+            return False
+        if (title or location) and name_title_location_key in seen_name_title_location:
+            return False
+        if url_key:
+            seen_urls.add(url_key)
+        if company:
+            seen_name_company.add(name_company_key)
+        if title or location:
+            seen_name_title_location.add(name_title_location_key)
+
+        lead = Lead(
+            full_name=name[:100],
+            first_name=first[:50],
+            last_name=last[:50],
+            title=title[:100],
+            company=company[:100],
+            location=location[:100],
+            linkedin_url=href[:200],
+            company_linkedin_url="",
+            email="",
+            phone="",
+            email_confidence="",
+            segment=Segment.NO_EMAIL,
+            status=LeadStatus.SCRAPED,
+        )
+        leads.append(lead)
+        self._leads.append(lead)
+        self.emit(EventType.LEAD_SCRAPED, {
+            "name": lead.full_name,
+            "company": lead.company,
+            "title": lead.title,
+            "location": lead.location,
+            "linkedin_url": lead.linkedin_url,
+            "total_so_far": len(leads),
+            "source": "sales_navigator_api",
+        })
+        return True
+
+    def _scrape_sales_navigator_fast(self, page, max_leads):
+        from src.agents.salesnav_extractor import extract_salesnav_leads
+        from src.storage import lead_repo, run_repo
+
+        self._extract_salesnav = extract_salesnav_leads
+        self._sales_nav_stop_reason = "unknown"
+        self.logger.info("Sales Navigator detected. Using fast search-API capture scraper.")
+        self.emit(EventType.LEAD_SCRAPED, {
+            "status": "sales_navigator_api",
+            "message": "Capturing Sales Navigator results from the page search API.",
+        })
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+        self._raise_if_sales_nav_rate_limited(page)
+
+        start_url = safe_str(self.filters.get("start_url"))
+        leads = []
+        seen_urls = set()
+        seen_name_company = set()
+        seen_name_title_location = set()
+
+        resume_from_checkpoint = bool(self.filters.get("resume_from_checkpoint"))
+        checkpoint = run_repo.get_checkpoint(self.run.id) if resume_from_checkpoint else None
+        start_page = int(self.filters.get("start_page") or 1)
+        if checkpoint:
+            start_page = max(start_page, int(checkpoint.get("last_page") or 0) + 1)
+
+        batch_page_limit = int(self.filters.get("batch_page_limit") or os.getenv("SCRAPER_BATCH_PAGE_LIMIT", "0") or 0)
+        max_pages = max(10, math.ceil(max_leads / 20) + 3)
+        if batch_page_limit > 0:
+            max_pages = min(max_pages, start_page + batch_page_limit - 1)
+
+        delay_min = float(os.getenv("SALES_NAV_PAGE_DELAY_MIN", "8"))
+        delay_max = float(os.getenv("SALES_NAV_PAGE_DELAY_MAX", "16"))
+        chunk_lead_limit = int(os.getenv("SALES_NAV_CHUNK_LEAD_LIMIT", "500") or 500)
+        chunk_page_limit = int(os.getenv("SALES_NAV_CHUNK_PAGE_LIMIT", "25") or 25)
+        cooldown_minutes = int(os.getenv("SALES_NAV_COOLDOWN_MINUTES", "20") or 20)
+        chunk_collected = 0
+        chunk_pages = 0
+
+        page_number = 1
+        last_saved_count = 0
+
+        if start_page > 1:
+            self.logger.info(f"Resuming Sales Navigator scrape from page {start_page}.")
+            while page_number < start_page:
+                if not self._click_sales_nav_next_page(page):
+                    self._sales_nav_stop_reason = self._sales_nav_last_next_failure or "resume_next_failed"
+                    return leads
+                page_number += 1
+                time.sleep(random.uniform(0.75, 1.5))
+
+        consecutive_zero = 0
+        first_capture = True
+
+        while len(leads) < max_leads and page_number <= max_pages:
+            self._raise_if_stop_requested()
+            self._raise_if_sales_nav_rate_limited(page)
+
+            if first_capture:
+                # run_agent already navigated, so re-open the search URL with the
+                # listener attached to reliably capture this page search response.
+                payload, _t, auth_or_rate = self._capture_salesnav_payload(
+                    page,
+                    lambda: page.goto(start_url, wait_until="domcontentloaded", timeout=60000),
+                )
+                first_capture = False
+            else:
+                clicked = {"ok": False}
+
+                def go_next():
+                    clicked["ok"] = self._click_sales_nav_next_page(page)
+                    return clicked["ok"]
+
+                payload, _t, auth_or_rate = self._capture_salesnav_payload(page, go_next)
+                if not clicked["ok"]:
+                    self._sales_nav_stop_reason = self._sales_nav_last_next_failure or "no_next_button"
+                    break
+
+            if auth_or_rate:
+                self._sales_nav_stop_reason = "rate_limited"
+                self.emit(EventType.AGENT_FAILED, {
+                    "status": "rate_limited",
+                    "message": "LinkedIn returned 401/403/429 on the search API. Stopped to keep the account safe.",
+                })
+                raise RuntimeError("LinkedIn Sales Navigator rate limit detected on the search API. Scraping paused. Retry later.")
+
+            self._raise_if_sales_nav_rate_limited(page)
+
+            if not payload:
+                self._sales_nav_stop_reason = "no_results" if page_number == start_page else "no_payload"
+                self.logger.warning(f"No Sales Navigator search payload captured on page {page_number}.")
+                break
+
+            records = extract_salesnav_leads(payload)
+            page_new = 0
+            for rec in records:
+                if len(leads) >= max_leads:
+                    break
+                if self._ingest_salesnav_record(rec, leads, seen_urls, seen_name_company, seen_name_title_location):
+                    page_new += 1
+
+            self.logger.info(f"Sales Navigator page {page_number} captured {page_new} new leads. Total {len(leads)}.")
+            chunk_collected += page_new
+            chunk_pages += 1
+
+            if len(leads) > last_saved_count:
+                new_leads = leads[last_saved_count:]
+                lead_repo.save_batch(self.run.id, new_leads)
+                last_saved_count = len(leads)
+                self.run.total_scraped = len(leads)
+                run_repo.save(self.run)
+                run_repo.update_checkpoint(run_id=self.run.id, last_page=page_number, leads_collected=len(leads))
+                self.emit(EventType.LEAD_SCRAPED, {
+                    "status": "checkpoint_saved",
+                    "page": page_number,
+                    "total_so_far": len(leads),
+                    "message": f"Saved checkpoint at page {page_number}.",
+                })
+
+            if len(leads) >= max_leads:
+                self._sales_nav_stop_reason = "max_leads_reached"
+                break
+
+            if page_new == 0:
+                consecutive_zero += 1
+                if consecutive_zero >= 2:
+                    self._sales_nav_stop_reason = "no_new_leads"
+                    break
+            else:
+                consecutive_zero = 0
+
+            if page_number >= max_pages:
+                self._sales_nav_stop_reason = "max_pages_reached"
+                break
+
+            if (
+                cooldown_minutes > 0
+                and len(leads) < max_leads
+                and (chunk_collected >= chunk_lead_limit or chunk_pages >= chunk_page_limit)
+            ):
+                self._salesnav_cooldown(cooldown_minutes, len(leads))
+                chunk_collected = 0
+                chunk_pages = 0
+
+            page_number += 1
+            time.sleep(random.uniform(delay_min, max(delay_min, delay_max)))
+
+        return leads
+
+    def _salesnav_cooldown(self, minutes, total_so_far):
+        total_seconds = max(0, int(minutes * 60))
+        self.logger.info(
+            f"Sales Navigator safe chunk reached. Cooling down {minutes} minute(s) "
+            f"with the session open. Collected {total_so_far} so far."
+        )
+        self.emit(EventType.LEAD_SCRAPED, {
+            "status": "cooldown",
+            "message": (
+                f"Safe chunk collected. Cooling down {minutes} minute(s) to stay "
+                f"under the rate limit. Collected {total_so_far} so far."
+            ),
+            "cooldown_minutes": minutes,
+            "total_so_far": total_so_far,
+        })
+        waited = 0
+        while waited < total_seconds:
+            self._raise_if_stop_requested()
+            step = min(15, total_seconds - waited)
+            time.sleep(step)
+            waited += step
+            remaining = max(0, total_seconds - waited)
+            if remaining == 0 or waited % 60 == 0:
+                self.emit(EventType.LEAD_SCRAPED, {
+                    "status": "cooldown",
+                    "message": f"Cooling down. About {math.ceil(remaining / 60)} minute(s) left.",
+                    "cooldown_minutes": minutes,
+                    "total_so_far": total_so_far,
+                })
+        self.emit(EventType.LEAD_SCRAPED, {
+            "status": "running",
+            "message": "Cooldown complete. Continuing the same Sales Navigator session.",
+            "total_so_far": total_so_far,
+        })
+
     def _page_hash(self, page: Page) -> str:
         import hashlib
 
@@ -2547,7 +2868,7 @@ el => Boolean(
             page.goto(start_url, wait_until="commit", timeout=60000)
 
             if is_sales_nav:
-                leads = self._scrape_sales_navigator(page, max_leads)
+                leads = self._scrape_sales_navigator_fast(page, max_leads)
                 self.run.total_scraped = len(leads)
                 if leads:
                     from src.storage import lead_repo
