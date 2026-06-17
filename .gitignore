@@ -10,7 +10,11 @@ debug/
 .vscode/
 .idea/
 dashboard/node_modules/
+desktop/node_modules/
+desktop/logs/
 dashboard/dist/
+build/
+dist/
 *.log
 dashboard/*smoke*.png
 backups/

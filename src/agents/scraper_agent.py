@@ -8,6 +8,7 @@ from playwright.sync_api import sync_playwright, Page, BrowserContext
 from src.agents.base import BaseAgent
 from src.config import settings
 from src.models import EventType, Lead, LeadStatus, PipelineRun, Segment
+from src.runtime_paths import configure_runtime_environment
 from src.storage import run_repo, lead_repo
 
 
@@ -638,7 +639,12 @@ class ScraperAgent(BaseAgent):
         self._raw_pages: list[str] = []
         self._sales_nav_stop_reason = "unknown"
         self._sales_nav_last_next_failure = "unknown"
-        self._debug_dir = os.path.join("debug", "runs", self.run.id[:8])
+        self._runtime_paths = configure_runtime_environment()
+        self._debug_dir = os.path.join(
+            str(self._runtime_paths.debug_dir),
+            "runs",
+            self.run.id[:8],
+        )
         os.makedirs(self._debug_dir, exist_ok=True)
 
         self._browser_agent = _BrowserAgent(self.logger)
@@ -1841,11 +1847,8 @@ el => Boolean(
             "message": "Sales Navigator detected. Using DOM scroll scraper.",
         })
         try:
-            os.makedirs("output", exist_ok=True)
-            debug_path = os.path.join(
-                "output",
-                f"salesnav_debug_{self.run.id}.jsonl",
-            )
+            settings.output_dir.mkdir(parents=True, exist_ok=True)
+            debug_path = settings.output_dir / f"salesnav_debug_{self.run.id}.jsonl"
             with open(debug_path, "w", encoding="utf-8"):
                 pass
         except Exception as exc:
@@ -2769,9 +2772,8 @@ el => Boolean(
         with sync_playwright() as pw:
             chrome_proc = None
             if chrome_exe:
-                debug_profile = os.path.join(
-                    os.path.expanduser("~"), "chrome-scraper-profile"
-                )
+                runtime_paths = configure_runtime_environment()
+                debug_profile = str(runtime_paths.chrome_profile_dir)
                 os.makedirs(debug_profile, exist_ok=True)
                 chrome_proc = subprocess.Popen([
                     chrome_exe,

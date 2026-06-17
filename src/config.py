@@ -4,9 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 from src.models import EnrichmentMode, OutputFormat
+from src.runtime_paths import configure_runtime_environment
 
 
 class ConfigError(Exception):
@@ -34,7 +33,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    runtime_paths = configure_runtime_environment()
 
     zoominfo_enabled = os.getenv("ZOOMINFO_ENABLED", "").lower() == "true"
     enrichment_mode = (
@@ -57,10 +56,10 @@ def load_settings() -> Settings:
         zoominfo_client_id=zoominfo_client_id,
         zoominfo_private_key=zoominfo_private_key,
         output_format=output_format,
-        output_dir=Path(os.getenv("OUTPUT_DIR", "./output")),
+        output_dir=Path(os.getenv("OUTPUT_DIR", str(runtime_paths.output_dir))),
         max_leads=int(os.getenv("MAX_LEADS", "1000")),
         smtp_timeout=int(os.getenv("SMTP_TIMEOUT", "10")),
-        db_path=Path(os.getenv("DB_PATH", "./pipeline.db")),
+        db_path=Path(os.getenv("DB_PATH", str(runtime_paths.db_path))),
     )
 
 

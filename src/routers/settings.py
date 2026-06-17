@@ -1,6 +1,11 @@
 from fastapi import APIRouter
 
 from src.api_helpers import *
+from src.runtime_paths import (
+    configure_runtime_environment,
+    load_runtime_env,
+    user_env_path,
+)
 from src.storage import kv_repo
 
 
@@ -69,7 +74,8 @@ def save_settings(request: SettingsRequest) -> dict:
     Save settings to .env file.
     Only updates operational, non-secret settings.
     """
-    env_path = Path(".env")
+    env_path = user_env_path()
+    env_path.parent.mkdir(parents=True, exist_ok=True)
     existing = {}
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -115,11 +121,10 @@ def save_settings(request: SettingsRequest) -> dict:
 @router.post("/api/settings/test-email")
 def test_email_connection() -> dict:
     """Send a test email to the sender's own address."""
-    from dotenv import load_dotenv as _load_dotenv
     import msal as _msal
     import requests as _requests
 
-    _load_dotenv(override=True)
+    load_runtime_env(override=True)
     tenant_id = os.getenv("AZURE_TENANT_ID", "")
     client_id = os.getenv("AZURE_CLIENT_ID", "")
     client_secret = os.getenv("AZURE_CLIENT_SECRET", "")
@@ -202,13 +207,13 @@ def list_knowledge_bases() -> list[str]:
 @router.post("/api/knowledge-bases/upload")
 async def upload_kb_file(file: UploadFile = File(...)) -> dict:
     """
-    Upload a knowledge base file to the knowledge_base/ folder.
+    Upload a knowledge base file to the configured knowledge base folder.
     Supports .txt, .pdf, .docx
     Converts PDF and DOCX to plain text automatically.
     """
     from pathlib import Path
 
-    kb_dir = Path("knowledge_base")
+    kb_dir = configure_runtime_environment().knowledge_base_dir
     kb_dir.mkdir(exist_ok=True)
 
     filename = file.filename or "uploaded.txt"

@@ -1,4 +1,4 @@
-import { BrowserRouter, Navigate, NavLink, Route, Routes, useParams } from "react-router-dom"
+import { BrowserRouter, HashRouter, Navigate, NavLink, Route, Routes, useParams } from "react-router-dom"
 import Campaigns from "./pages/Campaigns"
 import CampaignDetail from "./pages/campaign/CampaignDetail"
 import RunDetailView from "./pages/campaign/RunDetailView"
@@ -125,11 +125,13 @@ function AppShell() {
 }
 
 export default function App() {
+  const Router = window.location.protocol === "file:" ? HashRouter : BrowserRouter
+
   return (
-    <BrowserRouter>
+    <Router>
       <ToastProvider>
         <AppShell />
       </ToastProvider>
-    </BrowserRouter>
+    </Router>
   )
 }

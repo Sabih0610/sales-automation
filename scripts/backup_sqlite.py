@@ -3,13 +3,13 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+from src.runtime_paths import configure_runtime_environment
 
 
 def main() -> None:
-    load_dotenv()
+    runtime_paths = configure_runtime_environment()
 
-    db_path = Path(os.getenv("DB_PATH", "./pipeline.db"))
+    db_path = Path(os.getenv("DB_PATH", str(runtime_paths.db_path)))
     backup_dir = Path(os.getenv("DB_BACKUP_DIR", "./backups"))
     backup_dir.mkdir(parents=True, exist_ok=True)
 

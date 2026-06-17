@@ -10,7 +10,10 @@ if sys.platform.startswith("win"):
 import argparse
 import json
 import logging
+import os
 import sys
+
+from src.runtime_paths import configure_runtime_environment
 
 
 def _csv(value: str) -> list[str]:
@@ -177,9 +180,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    runtime_paths = configure_runtime_environment()
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if runtime_paths.use_app_data or os.getenv("LOG_DIR", "").strip():
+        runtime_paths.log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(
+            logging.FileHandler(
+                runtime_paths.log_dir / "backend.log",
+                encoding="utf-8",
+            )
+        )
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
     )
     parser = build_parser()
     args = parser.parse_args()

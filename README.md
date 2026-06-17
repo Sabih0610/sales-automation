@@ -74,6 +74,156 @@ http://127.0.0.1:5173
 
 The API runs on `http://localhost:8000` by default.
 
+## Desktop Wrapper
+
+The Electron wrapper can run in two modes:
+
+- Development desktop mode loads the Vite dashboard at `http://127.0.0.1:5173`.
+- Production desktop mode loads the built files from `dashboard/dist/index.html`.
+
+In both modes, Electron starts the local FastAPI backend automatically if
+`http://127.0.0.1:8000/api/health` is not already responding. If a backend is
+already running on port `8000`, Electron reuses it and leaves it running when
+the desktop app closes. If Electron starts the backend, it stops only that
+backend process when the desktop app closes. Backend output is written to
+`desktop/logs/backend.log` in development desktop mode and to
+`%LOCALAPPDATA%\RoyalCyberLeadPipeline\logs\backend.log` in production
+desktop mode.
+
+Production desktop mode starts the packaged backend executable at
+`dist/royal-cyber-backend/royal-cyber-backend.exe`. Development desktop mode
+keeps using `python main.py serve`.
+
+Start the backend manually only if you want to run it outside Electron:
+
+```bash
+python main.py serve
+```
+
+### Build Backend Exe
+
+Install build-only packaging dependencies:
+
+```bash
+python -m pip install -r requirements-build.txt
+```
+
+Build the backend executable:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_backend_exe.ps1
+```
+
+Or from the desktop package:
+
+```bash
+cd desktop
+npm run build:backend
+```
+
+The output is:
+
+```text
+dist/royal-cyber-backend/royal-cyber-backend.exe
+```
+
+The build includes backend code plus `migrations/`, `knowledge_base/`,
+`campaigns/`, and `.env.example`. Real `.env` files are not bundled. In
+production desktop mode the backend reads user configuration from app-data
+`.env` when present, then falls back to a local project `.env` during
+development.
+
+Chrome/Sales Navigator scraping continues to use installed Google Chrome or the
+configured `CHROME_PATH`; this build does not bundle a browser.
+
+### Development Desktop Mode
+
+Start the dashboard in one terminal:
+
+```bash
+cd dashboard
+npm run dev
+```
+
+Start Electron in another terminal:
+
+```bash
+cd desktop
+npm install
+npm run dev
+```
+
+Development desktop mode still uses Vite for fast frontend iteration.
+
+### Production Desktop Mode
+
+Build the dashboard:
+
+```bash
+cd dashboard
+npm run build
+```
+
+Run Electron against the built dashboard files:
+
+```bash
+cd desktop
+npm install
+npm start
+```
+
+You can also build the dashboard from the desktop package:
+
+```bash
+cd desktop
+npm run build:dashboard
+npm start
+```
+
+Or build and launch in one step:
+
+```bash
+cd desktop
+npm run prod
+```
+
+Production desktop mode does not require the Vite dev server. The built
+dashboard uses `http://127.0.0.1:8000` for API requests and
+`ws://127.0.0.1:8000` for WebSocket updates. Build the backend executable before
+running production desktop mode. To point development desktop mode at a
+different dashboard URL, set `RCLP_DASHBOARD_URL` before running `npm run dev`.
+
+### Desktop App Data
+
+Production desktop mode stores runtime data outside the app folder at:
+
+```text
+%LOCALAPPDATA%\RoyalCyberLeadPipeline\
+```
+
+Electron passes these backend paths in production desktop mode:
+
+```text
+APP_DATA_DIR=%LOCALAPPDATA%\RoyalCyberLeadPipeline
+DB_PATH=%LOCALAPPDATA%\RoyalCyberLeadPipeline\pipeline.db
+OUTPUT_DIR=%LOCALAPPDATA%\RoyalCyberLeadPipeline\output
+LOG_DIR=%LOCALAPPDATA%\RoyalCyberLeadPipeline\logs
+CHROME_PROFILE_DIR=%LOCALAPPDATA%\RoyalCyberLeadPipeline\chrome-scraper-profile
+DEBUG_DIR=%LOCALAPPDATA%\RoyalCyberLeadPipeline\debug
+KNOWLEDGE_BASE_DIR=%LOCALAPPDATA%\RoyalCyberLeadPipeline\knowledge_base
+```
+
+The app-data folder may also contain a user `.env` file and uploaded knowledge
+base files. If the app-data database does not exist and a project-root
+`pipeline.db` exists, the backend copies it once into app-data and never
+overwrites an existing app-data database.
+
+To back up desktop data, stop the desktop app and copy `pipeline.db*` plus the
+`output\` folder from `%LOCALAPPDATA%\RoyalCyberLeadPipeline\`. To reset local
+desktop data, stop the app and delete `%LOCALAPPDATA%\RoyalCyberLeadPipeline\`.
+Only do this if you no longer need the local database, exports, logs, Chrome
+scraper login profile, or app-data `.env`.
+
 ## Scraping Notes
 
 The scraper supports two flows:
@@ -89,7 +239,11 @@ For Chrome/CDP scraping, the app looks for Chrome automatically. If Chrome is in
 CHROME_PATH=C:\Path\To\chrome.exe
 ```
 
-When a run opens Chrome, sign in or complete CAPTCHA manually if needed. The scraper uses a separate local Chrome profile directory named `chrome-scraper-profile`.
+When a run opens Chrome, sign in or complete CAPTCHA manually if needed. In
+development the scraper keeps using a separate local Chrome profile named
+`chrome-scraper-profile` under your user folder. In production desktop mode the
+profile is stored in
+`%LOCALAPPDATA%\RoyalCyberLeadPipeline\chrome-scraper-profile`.
 
 ## CLI Usage
 
@@ -122,6 +276,11 @@ Backend settings live in `.env`:
 - `OUTPUT_FORMAT`: `xlsx` or `csv`.
 - `OUTPUT_DIR`: export directory.
 - `DB_PATH`: local SQLite database path.
+- `APP_DATA_DIR`: optional desktop app-data root override.
+- `LOG_DIR`: backend log directory.
+- `CHROME_PROFILE_DIR`: Chrome scraper profile directory.
+- `DEBUG_DIR`: scraper/debug artifact directory.
+- `KNOWLEDGE_BASE_DIR`: uploaded knowledge base file directory.
 - `ZOOMINFO_*`: optional ZoomInfo credentials.
 - `AZURE_*` and `SENDER_EMAIL`: optional Microsoft Graph sending credentials.
 - `REPLY_MONITOR_ENABLED`: set `true` only after Microsoft Graph is configured.
@@ -137,10 +296,16 @@ Never commit real `.env` files. They are ignored by Git.
 
 ## Database And Migrations
 
-The app uses local SQLite. By default the database is:
+The app uses local SQLite. In development the default database is:
 
 ```text
 pipeline.db
+```
+
+In production desktop mode the default database is:
+
+```text
+%LOCALAPPDATA%\RoyalCyberLeadPipeline\pipeline.db
 ```
 
 Migrations live in `migrations/` and are applied automatically when `src/storage.py` opens the database.
@@ -183,6 +348,9 @@ When `OUTPUT_FORMAT=csv`, exports three files:
 - `leads_cold_<timestamp>.csv`
 - `leads_no_email_<timestamp>.csv`
 
+In development exports default to `output\`. In production desktop mode they
+default to `%LOCALAPPDATA%\RoyalCyberLeadPipeline\output\`.
+
 Generated output, logs, local databases, debug files, virtual environments, and `node_modules` are ignored by Git.
 
 ## Useful Checks
@@ -218,6 +386,10 @@ sales automation/
 |   |-- src/
 |   |-- package.json
 |   `-- vite.config.js
+|-- desktop/
+|   |-- main.js
+|   |-- package.json
+|   `-- scripts/
 |-- migrations/
 |-- scripts/
 |-- main.py

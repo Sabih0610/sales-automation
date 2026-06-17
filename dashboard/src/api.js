@@ -1,8 +1,17 @@
 import axios from "axios"
 
-const BASE = import.meta.env.VITE_API_BASE || ""
-const WS_BASE = import.meta.env.VITE_WS_BASE || window.location.origin.replace(/^http/, "ws")
-const API_KEY = import.meta.env.VITE_API_KEY || ""
+const runtimeParams = new URLSearchParams(window.location.search)
+const isFileDashboard = window.location.protocol === "file:"
+const defaultApiBase = isFileDashboard ? "http://127.0.0.1:8000" : ""
+const defaultWsBase = isFileDashboard
+  ? "ws://127.0.0.1:8000"
+  : window.location.origin.replace(/^http/, "ws")
+
+const runtimeValue = (name) => runtimeParams.get(name) || ""
+
+const BASE = runtimeValue("apiBase") || import.meta.env.VITE_API_BASE || defaultApiBase
+const WS_BASE = runtimeValue("wsBase") || import.meta.env.VITE_WS_BASE || defaultWsBase
+const API_KEY = runtimeValue("apiKey") || (import.meta.env.DEV ? import.meta.env.VITE_API_KEY || "" : "")
 
 const client = axios.create({
   baseURL: BASE,

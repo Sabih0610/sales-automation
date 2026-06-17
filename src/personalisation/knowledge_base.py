@@ -4,12 +4,24 @@ import pathlib
 import re
 
 from src.personalisation.models import CampaignConfig, KBChunk, RelevantContext
+from src.runtime_paths import bundled_knowledge_base_dir, configure_runtime_environment
 
 
 KB_DIR = pathlib.Path("knowledge_base")
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 50
 TOP_K = 4
+
+
+def _knowledge_base_dirs() -> list[pathlib.Path]:
+    runtime_paths = configure_runtime_environment()
+    dirs = [pathlib.Path(runtime_paths.knowledge_base_dir)]
+    bundled_dir = pathlib.Path(bundled_knowledge_base_dir())
+    if bundled_dir not in dirs:
+        dirs.append(bundled_dir)
+    if KB_DIR not in dirs:
+        dirs.append(KB_DIR)
+    return dirs
 
 
 class KnowledgeBaseLoader:
@@ -51,17 +63,20 @@ class KnowledgeBaseLoader:
     @staticmethod
     def list_kb_files() -> list[str]:
         """Return all .txt filenames in knowledge_base/ folder."""
-        if not KB_DIR.exists():
-            return []
-        return sorted(f.name for f in KB_DIR.glob("*.txt"))
+        names: set[str] = set()
+        for directory in _knowledge_base_dirs():
+            if directory.exists():
+                names.update(f.name for f in directory.glob("*.txt"))
+        return sorted(names)
 
     @staticmethod
     def load_kb_file(filename: str) -> str:
         """Load raw text from a KB file."""
-        path = KB_DIR / filename
-        if not path.exists():
-            raise FileNotFoundError(f"KB file not found: {filename}")
-        return path.read_text(encoding="utf-8")
+        for directory in _knowledge_base_dirs():
+            path = directory / filename
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+        raise FileNotFoundError(f"KB file not found: {filename}")
 
 
 class KBChunker:
