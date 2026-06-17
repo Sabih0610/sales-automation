@@ -525,3 +525,37 @@ export const useCancelJob = () => {
     },
   })
 }
+
+
+export const useSequenceSampleLeads = (filename, params = {}, enabled = true) =>
+  useQuery({
+    queryKey: ["campaign", filename, "sample-leads", params],
+    queryFn: () => unwrap(api.getSequenceSampleLeads(filename, params)),
+    enabled: !!filename && enabled,
+    placeholderData: (prev) => prev,
+  })
+
+export const useSequencePreview = (filename) =>
+  useMutation({
+    mutationFn: (data) => api.previewSequenceEmail(filename, data),
+  })
+
+
+export const useSequenceMembers = (filename, params = {}) =>
+  useQuery({
+    queryKey: ["campaign", filename, "sequence-members", params],
+    queryFn: () => unwrap(api.getSequenceMembers(filename, params)),
+    enabled: !!filename,
+    placeholderData: (prev) => prev,
+  })
+
+export const useRemoveSequenceMember = (filename) => {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (leadId) => api.removeSequenceMember(filename, leadId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["campaign", filename, "sequence-members"] })
+      invalidateCampaign(qc, filename)
+    },
+  })
+}

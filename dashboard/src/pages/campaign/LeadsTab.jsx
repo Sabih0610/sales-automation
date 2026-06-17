@@ -565,14 +565,23 @@ export default function LeadsTab({ filename, onSelectTab, showNotice }) {
                         <div className="lead-subline">
                           {lead.company || "—"} · {lead.title || "—"}
                         </div>
-                        {lead.duplicate_of_lead_id && (
+                        {lead.other_campaigns?.length > 0 ? (
+                          <span
+                            className="pill-amber"
+                            title={`Also in: ${lead.other_campaigns.join(", ")}`}
+                          >
+                            {lead.other_campaigns.length === 1
+                              ? `Also in: ${lead.other_campaigns[0]}`
+                              : `Also in: ${lead.other_campaigns[0]} +${lead.other_campaigns.length - 1}`}
+                          </span>
+                        ) : lead.duplicate_of_lead_id ? (
                           <span
                             className="pill-amber"
                             title="This person also exists in another campaign"
                           >
                             Also in another campaign
                           </span>
-                        )}
+                        ) : null}
                         {lead.is_suppressed && (
                           <span className="pill-amber">
                             Suppressed

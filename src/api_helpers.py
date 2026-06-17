@@ -245,6 +245,13 @@ class DraftSendTestRequest(BaseModel):
     test_email: str = ""
 
 
+class SequencePreviewRequest(BaseModel):
+    subject_template: str = ""
+    email_body_template: str = ""
+    touch_number: int = 1
+    sample_lead_id: str = ""
+
+
 class QueueGenerateDueRequest(BaseModel):
     lead_ids: list[str] = []
     touch_number: int | None = None
@@ -1055,6 +1062,7 @@ STOPPED_SEQUENCE_STATUSES = {
     "do_not_contact",
     "completed",
     "skipped",
+    "removed",
 }
 VALID_DRAFT_STATUSES = {
     "draft",

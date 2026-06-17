@@ -500,7 +500,9 @@ def get_campaign_leads(
             limit=limit,
             offset=offset,
         )
-        return [_campaign_lead_payload(row) for row in rows]
+        payloads = [_campaign_lead_payload(row) for row in rows]
+        _attach_other_campaigns(payloads, campaign_filename)
+        return payloads
 
     page = max(1, int(page))
     page_size = min(200, max(1, int(page_size)))
@@ -514,8 +516,11 @@ def get_campaign_leads(
         offset=(page - 1) * page_size,
     )
 
+    payloads = [_campaign_lead_payload(row) for row in items]
+    _attach_other_campaigns(payloads, campaign_filename)
+
     return {
-        "items": [_campaign_lead_payload(row) for row in items],
+        "items": payloads,
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -1785,6 +1790,226 @@ def delete_campaign(campaign_filename: str) -> dict:
         "counts": counts,
     }
 
+
+
+@router.get("/api/campaigns/{campaign_filename}/sequence/sample-leads")
+def sequence_sample_leads(
+    campaign_filename: str,
+    q: str = "",
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict]:
+    # Light, name-first list for the sample email picker.
+    items, _total = lead_repo.search_campaign_page(
+        campaign_filename=campaign_filename,
+        q=(q or "").strip(),
+        segment="",
+        sequence_status="",
+        limit=limit,
+        offset=0,
+    )
+    return [
+        {
+            "id": row.get("id", ""),
+            "full_name": row.get("full_name", "") or "Unknown lead",
+            "company": row.get("company", "") or "",
+            "title": row.get("title", "") or "",
+            "has_email": bool(row.get("email")),
+        }
+        for row in items
+    ]
+
+
+@router.post("/api/campaigns/{campaign_filename}/sequence/preview")
+def sequence_preview(
+    campaign_filename: str,
+    request: SequencePreviewRequest,
+) -> dict:
+    # Generates a sample only. Persists nothing: no draft, no state, no send.
+    subject_direction = (request.subject_template or "").strip()
+    body_direction = (request.email_body_template or "").strip()
+    if not subject_direction and not body_direction:
+        raise HTTPException(
+            status_code=400,
+            detail="Add a subject direction or AI instructions before previewing.",
+        )
+
+    sample = None
+    if request.sample_lead_id:
+        sample = lead_repo.get_by_id(request.sample_lead_id)
+    if sample is None:
+        campaign_leads = _campaign_leads(campaign_filename)
+        for lead in campaign_leads:
+            if lead.email:
+                sample = lead
+                break
+        if sample is None and campaign_leads:
+            sample = campaign_leads[0]
+    if sample is None:
+        sample = Lead(
+            full_name="Jordan Avery",
+            first_name="Jordan",
+            last_name="Avery",
+            title="VP Engineering",
+            company="Northwind Logistics",
+            location="Chicago, IL",
+            email="jordan.avery@example.com",
+        )
+
+    used_ai = False
+    error = ""
+    subject = ""
+    body = ""
+    linkedin_message = ""
+    research_summary = ""
+
+    if _ai_personalised_drafts_enabled():
+        try:
+            campaign_config = KnowledgeBaseLoader.load_campaign(campaign_filename)
+            research_agent = WebResearchAgent()
+            context_agent = ContextAgent(campaign_config)
+            writer_agent = WriterAgent(
+                campaign_config,
+                touch1_template={
+                    "subject_template": subject_direction,
+                    "email_body_template": body_direction,
+                    "linkedin_message_template": "",
+                },
+            )
+            # Role inference only: no website scrape, no browser launch.
+            research = research_agent._infer_from_role(sample)
+            context = context_agent.get_context(sample, research)
+            message = writer_agent.write(sample, research, context)
+            if message.error:
+                raise RuntimeError(message.error)
+            subject = (message.email_subject or "").strip()
+            body = (message.email_body or "").strip()
+            linkedin_message = (message.linkedin_message or "").strip()
+            research_summary = (message.research_summary or "").strip()
+            if subject or body:
+                used_ai = True
+        except Exception as exc:
+            error = str(exc)
+
+    if not used_ai:
+        subject = render_template(subject_direction, sample, campaign_filename) or subject_direction
+        body = render_template(body_direction, sample, campaign_filename) or body_direction
+
+    body = _ensure_sender_signature(body, campaign_filename)
+
+    return {
+        "subject": subject,
+        "body": body,
+        "linkedin_message": linkedin_message,
+        "research_summary": research_summary,
+        "used_ai": used_ai,
+        "error": error,
+        "sample_lead": {
+            "id": sample.id,
+            "full_name": sample.full_name,
+            "title": sample.title,
+            "company": sample.company,
+        },
+    }
+
+
+def _norm_campaign_key(value: str) -> str:
+    return (value or "").replace(".json", "").replace("_", " ").lower().strip()
+
+
+def _norm_linkedin(value: str) -> str:
+    return (value or "").strip().split("?", 1)[0].rstrip("/").lower()
+
+
+def _attach_other_campaigns(items: list[dict], campaign_filename: str) -> None:
+    # Names every OTHER campaign each person appears in, matched by email or LinkedIn.
+    for item in items:
+        item.setdefault("other_campaigns", [])
+    if not items:
+        return
+    emails = [item.get("email", "") for item in items]
+    links = [item.get("linkedin_url", "") for item in items]
+    matched = lead_repo.leads_matching(emails, links)
+    if not matched:
+        return
+
+    run_to_campaign = {}
+    for run in run_repo.list_all():
+        filters = run.filters or {}
+        run_to_campaign[run.id] = (
+            filters.get("campaign_key") or filters.get("campaign") or ""
+        )
+    name_map = {}
+    for campaign in campaign_repo.list_all():
+        name_map[_norm_campaign_key(campaign.get("filename", ""))] = (
+            campaign.get("name") or campaign.get("filename", "")
+        )
+    current = _norm_campaign_key(campaign_filename)
+
+    by_email = {}
+    by_link = {}
+    for row in matched:
+        cf = run_to_campaign.get(row.get("run_id", ""), "")
+        if not cf or _norm_campaign_key(cf) == current:
+            continue
+        display = name_map.get(_norm_campaign_key(cf)) or _norm_campaign_key(cf)
+        em = (row.get("email", "") or "").strip().lower()
+        lk = _norm_linkedin(row.get("linkedin_url", ""))
+        if em:
+            by_email.setdefault(em, [])
+            if display not in by_email[em]:
+                by_email[em].append(display)
+        if lk:
+            by_link.setdefault(lk, [])
+            if display not in by_link[lk]:
+                by_link[lk].append(display)
+
+    for item in items:
+        em = (item.get("email", "") or "").strip().lower()
+        lk = _norm_linkedin(item.get("linkedin_url", ""))
+        names = []
+        for name in by_email.get(em, []) + by_link.get(lk, []):
+            if name not in names:
+                names.append(name)
+        item["other_campaigns"] = names
+
+
+@router.get("/api/campaigns/{campaign_filename}/sequence/members")
+def sequence_members(
+    campaign_filename: str,
+    q: str = "",
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    rows, total = outreach_repo.list_sequence_members(campaign_filename, q=q, limit=limit)
+    _attach_other_campaigns(rows, campaign_filename)
+    items = [
+        {
+            "lead_id": row.get("lead_id", ""),
+            "full_name": row.get("full_name", "") or "Unknown lead",
+            "company": row.get("company", "") or "",
+            "title": row.get("title", "") or "",
+            "current_touch": int(row.get("current_touch") or 0),
+            "status": row.get("status", "") or "not_started",
+            "next_touch_due_at": row.get("next_touch_due_at") or "",
+            "other_campaigns": row.get("other_campaigns", []),
+        }
+        for row in rows
+    ]
+    return {"items": items, "total": total}
+
+
+@router.post("/api/campaigns/{campaign_filename}/sequence/members/{lead_id}/remove")
+def remove_sequence_member(
+    campaign_filename: str,
+    lead_id: str,
+) -> dict:
+    # This campaign only. Cancels any scheduled-but-unsent email for this lead here.
+    _stop_sequence(
+        lead_id,
+        campaign_filename,
+        "removed",
+        "manually removed from sequence",
+    )
+    return {"removed": True, "lead_id": lead_id}
 
 
 @router.get("/api/campaigns")

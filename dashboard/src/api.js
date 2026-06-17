@@ -203,4 +203,14 @@ export const openWS = (runId, onMsg) => {
   return ws
 }
 
+export const getSequenceSampleLeads = (filename, params = {}) =>
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/sequence/sample-leads`, { params })
+export const previewSequenceEmail = (filename, data) =>
+  client.post(`/api/campaigns/${encodeURIComponent(filename)}/sequence/preview`, data)
+
+export const getSequenceMembers = (filename, params = {}) =>
+  client.get(`/api/campaigns/${encodeURIComponent(filename)}/sequence/members`, { params })
+export const removeSequenceMember = (filename, leadId) =>
+  client.post(`/api/campaigns/${encodeURIComponent(filename)}/sequence/members/${encodeURIComponent(leadId)}/remove`)
+
 export default client

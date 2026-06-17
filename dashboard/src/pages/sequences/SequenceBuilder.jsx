@@ -18,6 +18,8 @@ import {
 } from "./sequenceAdapters"
 import StepCard, { StartNode } from "./StepCard.jsx"
 import StepEditorModal from "./StepEditorModal.jsx"
+import SampleEmailModal from "./SampleEmailModal.jsx"
+import SequenceMembersCard from "./SequenceMembersCard.jsx"
 import "./sequenceBuilder.css"
 
 function AddStepButton({ index, onAdd, open, setOpen }) {
@@ -120,6 +122,7 @@ export default function SequenceBuilder({
   const [openAddIndex, setOpenAddIndex] = useState(null)
   const [editingStepId, setEditingStepId] = useState("")
   const [sequenceMenuOpen, setSequenceMenuOpen] = useState(false)
+  const [sampleOpen, setSampleOpen] = useState(false)
 
   useEffect(() => {
     setSequenceName(initialBuilderState.name)
@@ -379,6 +382,13 @@ export default function SequenceBuilder({
 
           <div className="builder-top-actions">
             <ProductButton
+              icon="ti-eye"
+              onClick={() => setSampleOpen(true)}
+            >
+              Sample email
+            </ProductButton>
+
+            <ProductButton
               disabled={saveSequence.isPending}
               icon="ti-device-floppy"
               onClick={saveDraft}
@@ -493,26 +503,17 @@ export default function SequenceBuilder({
 
           <aside className="builder-right-sidebar">
             <ProductCard className="builder-side-panel">
-              <h2>Global exit rules</h2>
-              <p>Contacts who meet any of these rules will exit this sequence.</p>
-
-              <div className="side-rule-list">
-                <div>
-                  <strong>Replied</strong>
-                  <span>Exits immediately</span>
-                </div>
-
-                <div>
-                  <strong>Bounced</strong>
-                  <span>Exits immediately</span>
-                </div>
-
-                <div>
-                  <strong>Unsubscribed</strong>
-                  <span>Exits immediately</span>
-                </div>
+              <h2>Exit rules</h2>
+              <div className="exit-chip-row">
+                <span>Replied</span>
+                <span>Bounced</span>
+                <span>Unsubscribed</span>
               </div>
             </ProductCard>
+
+            {campaignFilename && (
+              <SequenceMembersCard campaignFilename={campaignFilename} />
+            )}
 
             <ProductCard className="builder-side-panel">
               <h2>Delivery settings</h2>
@@ -553,6 +554,17 @@ export default function SequenceBuilder({
         onSave={saveStep}
         open={Boolean(editingStep)}
         step={editingStep}
+      />
+
+      <SampleEmailModal
+        campaignFilename={campaignFilename}
+        emailSteps={steps.filter((step) => step.type === "email").map((step) => ({
+          number: step.number,
+          subject: step.subject,
+          body: step.body,
+        }))}
+        onClose={() => setSampleOpen(false)}
+        open={sampleOpen}
       />
     </>
   )

@@ -50,6 +50,7 @@ STOPPED_SEQUENCE_STATUSES = {
     "do_not_contact",
     "completed",
     "skipped",
+    "removed",
 }
 
 
@@ -1651,13 +1652,65 @@ class OutreachRepository:
             FROM lead_sequence_state s
             JOIN leads l ON l.id = s.lead_id
             WHERE s.campaign_filename = ?
-              AND s.status IN ('replied', 'bounced', 'unsubscribed', 'do_not_contact', 'skipped')
+              AND s.status IN ('replied', 'bounced', 'unsubscribed', 'do_not_contact', 'skipped', 'removed')
             ORDER BY s.updated_at DESC
             LIMIT 1000
             """,
             (campaign_filename,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_sequence_members(
+        self,
+        campaign_filename: str,
+        q: str = "",
+        limit: int = 200,
+    ) -> tuple[list[dict], int]:
+        stopped = tuple(sorted(STOPPED_SEQUENCE_STATUSES))
+        ph = ",".join("?" for _ in stopped)
+        conn = self.db.conn()
+        where = [
+            "s.campaign_filename = ?",
+            f"LOWER(COALESCE(s.status, '')) NOT IN ({ph})",
+        ]
+        params = [campaign_filename, *stopped]
+        q = (q or "").strip()
+        if q:
+            like = f"%{q}%"
+            where.append("(l.full_name LIKE ? OR l.email LIKE ?)")
+            params.extend([like, like])
+        where_sql = " AND ".join(where)
+        total_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM lead_sequence_state s
+            JOIN leads l ON l.id = s.lead_id
+            WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        total = int(total_row["total"] or 0) if total_row else 0
+        rows = conn.execute(
+            f"""
+            SELECT
+                s.lead_id AS lead_id,
+                l.full_name AS full_name,
+                l.company AS company,
+                l.title AS title,
+                l.email AS email,
+                l.linkedin_url AS linkedin_url,
+                s.current_touch AS current_touch,
+                s.status AS status,
+                s.next_touch_due_at AS next_touch_due_at
+            FROM lead_sequence_state s
+            JOIN leads l ON l.id = s.lead_id
+            WHERE {where_sql}
+            ORDER BY s.current_touch DESC, l.full_name COLLATE NOCASE ASC
+            LIMIT ?
+            """,
+            [*params, int(limit)],
+        ).fetchall()
+        return [dict(row) for row in rows], total
 
     def latest_draft_for_touch(
         self,
@@ -2043,6 +2096,67 @@ class LeadRepository:
                 }
 
         return None
+
+    def leads_matching(
+        self,
+        emails: list[str],
+        linkedin_urls: list[str],
+    ) -> list[dict]:
+        # Same person across campaigns: match email (case-insensitive) OR normalized LinkedIn.
+        conn = self.db.conn()
+        norm_emails = sorted({
+            (e or "").strip().lower()
+            for e in (emails or [])
+            if (e or "").strip()
+        })
+        norm_links = {
+            self._normalize_linkedin_url(u)
+            for u in (linkedin_urls or [])
+            if (u or "").strip()
+        }
+        out: dict[str, dict] = {}
+
+        for i in range(0, len(norm_emails), 400):
+            chunk = norm_emails[i:i + 400]
+            if not chunk:
+                continue
+            ph = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"""
+                SELECT id, run_id,
+                       COALESCE(email, '') AS email,
+                       COALESCE(linkedin_url, '') AS linkedin_url
+                FROM leads
+                WHERE LOWER(COALESCE(email, '')) IN ({ph})
+                """,
+                chunk,
+            ).fetchall():
+                out[row["id"]] = {
+                    "id": row["id"],
+                    "run_id": row["run_id"] or "",
+                    "email": row["email"] or "",
+                    "linkedin_url": row["linkedin_url"] or "",
+                }
+
+        if norm_links:
+            for row in conn.execute(
+                """
+                SELECT id, run_id,
+                       COALESCE(email, '') AS email,
+                       COALESCE(linkedin_url, '') AS linkedin_url
+                FROM leads
+                WHERE COALESCE(linkedin_url, '') != ''
+                """
+            ).fetchall():
+                if self._normalize_linkedin_url(row["linkedin_url"]) in norm_links:
+                    out[row["id"]] = {
+                        "id": row["id"],
+                        "run_id": row["run_id"] or "",
+                        "email": row["email"] or "",
+                        "linkedin_url": row["linkedin_url"] or "",
+                    }
+
+        return list(out.values())
 
     def set_duplicate_of(
         self,
