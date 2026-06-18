@@ -2,7 +2,10 @@ const { spawn } = require("node:child_process")
 const path = require("node:path")
 
 const dashboardDir = path.resolve(__dirname, "..", "..", "dashboard")
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm"
+const command = process.platform === "win32" ? (process.env.ComSpec || "cmd.exe") : "npm"
+const args = process.platform === "win32"
+  ? ["/d", "/s", "/c", "npm run build"]
+  : ["run", "build"]
 
 const env = {
   ...process.env,
@@ -11,7 +14,7 @@ const env = {
   VITE_API_KEY: "",
 }
 
-const child = spawn(npmCommand, ["run", "build"], {
+const child = spawn(command, args, {
   cwd: dashboardDir,
   env,
   stdio: "inherit",

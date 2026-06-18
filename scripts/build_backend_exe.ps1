@@ -30,12 +30,14 @@ $PyInstallerArgs = @(
     "--noconfirm",
     "--clean",
     "--name", "royal-cyber-backend",
+    "--paths", $Root,
     "--distpath", $DistPath,
     "--workpath", $WorkPath,
     "--specpath", $SpecPath,
     "--collect-submodules", "src",
     "--collect-submodules", "uvicorn",
     "--collect-submodules", "playwright",
+    "--hidden-import", "main",
     "--hidden-import", "src.api",
     "--hidden-import", "uvicorn.logging",
     "--hidden-import", "uvicorn.loops.auto",
@@ -49,7 +51,12 @@ Add-DataArg (Join-Path $Root "knowledge_base") "knowledge_base"
 Add-DataArg (Join-Path $Root "campaigns") "campaigns"
 Add-DataArg (Join-Path $Root ".env.example") ".env.example"
 
-python -m PyInstaller @PyInstallerArgs $EntryPoint
+Push-Location $Root
+try {
+    python -m PyInstaller @PyInstallerArgs $EntryPoint
+} finally {
+    Pop-Location
+}
 
 if (!(Test-Path $ExePath)) {
     throw "Expected backend executable was not created: $ExePath"
